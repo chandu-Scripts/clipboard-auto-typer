@@ -46,11 +46,6 @@ HOTKEY_DEBOUNCE_SECONDS = 0.5
 # the requested WPM without calling more often than that can support.
 UIA_CALL_INTERVAL_SECONDS = 0.5
 
-# Jobs triggered from the web portal (see remote_watch_loop) are meant to
-# appear almost instantly rather than at a natural typing pace, so they run
-# at this fixed high WPM instead of whatever the speed slider is set to.
-REMOTE_WPM = 1000
-
 # Text sent from the web portal is relayed through ntfy.sh (a free, public
 # pub/sub service - see https://ntfy.sh): the portal POSTs to a topic, this
 # app subscribes to that same topic over Server-Sent Events. The topic name
@@ -332,8 +327,28 @@ class App:
         root.title("Clipboard Auto Typer")
         root.geometry("560x300")
 
-        path_frame = tk.Frame(root)
-        path_frame.pack(fill="x", padx=10, pady=(12, 6))
+        # This laptop plays one of two roles at a time - "type" (types
+        # copied/relayed text into a local Notepad file) or "send" (relays
+        # its own clipboard to another laptop that's in "type" mode). Only
+        # one role's controls are relevant at once, so the mode switch below
+        # shows/hides them instead of leaving every control visible
+        # regardless of which role this machine is actually playing.
+        mode_frame = tk.Frame(root)
+        mode_frame.pack(fill="x", padx=10, pady=(12, 6))
+        tk.Label(mode_frame, text="This laptop:").pack(side="left")
+        self.mode_var = tk.StringVar(value="type")
+        tk.Radiobutton(
+            mode_frame, text="Types (into Notepad)", variable=self.mode_var, value="type", command=self.on_mode_change
+        ).pack(side="left", padx=(6, 0))
+        tk.Radiobutton(
+            mode_frame, text="Sends (to another laptop)", variable=self.mode_var, value="send", command=self.on_mode_change
+        ).pack(side="left", padx=(6, 0))
+
+        # ---- "type" mode controls ----
+        self.type_container = tk.Frame(root)
+
+        path_frame = tk.Frame(self.type_container)
+        path_frame.pack(fill="x", padx=10, pady=(0, 6))
         tk.Label(path_frame, text="Notepad file:").pack(side="left")
         self.file_path_var = tk.StringVar()
         self.file_path_entry = tk.Entry(path_frame, textvariable=self.file_path_var)
@@ -341,7 +356,7 @@ class App:
         self.browse_btn = tk.Button(path_frame, text="Browse...", command=self.browse_file)
         self.browse_btn.pack(side="left")
 
-        control_frame = tk.Frame(root)
+        control_frame = tk.Frame(self.type_container)
         control_frame.pack(fill="x", padx=10, pady=(0, 6))
 
         tk.Label(control_frame, text="Speed (WPM):").pack(side="left")
@@ -355,28 +370,38 @@ class App:
         self.stop_btn = tk.Button(control_frame, text="Stop", width=10, state="disabled", command=self.on_stop)
         self.stop_btn.pack(side="left", padx=4)
 
-        watch_frame = tk.Frame(root)
+        watch_frame = tk.Frame(self.type_container)
         watch_frame.pack(fill="x", padx=10, pady=(0, 6))
         self.watch_btn = tk.Button(watch_frame, text="Enable Clipboard Auto-Type", command=self.toggle_watch)
         self.watch_btn.pack(side="left")
 
-        remote_frame = tk.Frame(root)
-        remote_frame.pack(fill="x", padx=10, pady=(0, 6))
+        remote_frame = tk.Frame(self.type_container)
+        remote_frame.pack(fill="x", padx=10, pady=(0, 2))
         self.remote_btn = tk.Button(remote_frame, text="Enable Web Remote Trigger", command=self.toggle_remote_watch)
         self.remote_btn.pack(side="left")
+        self.remote_status_label = tk.Label(self.type_container, text="Remote trigger: Off", fg="gray", anchor="w")
+        self.remote_status_label.pack(fill="x", padx=10, pady=(0, 6))
 
-        send_remote_frame = tk.Frame(root)
-        send_remote_frame.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(self.type_container, text=f"Pause/Resume hotkey: {PAUSE_HOTKEY} (works from any app)", fg="gray").pack(
+            anchor="w", padx=10, pady=(0, 4)
+        )
+
+        self.type_container.pack(fill="x")
+
+        # ---- "send" mode controls ----
+        self.send_container = tk.Frame(root)
+
+        send_remote_frame = tk.Frame(self.send_container)
+        send_remote_frame.pack(fill="x", padx=10, pady=(0, 2))
         self.send_remote_btn = tk.Button(
             send_remote_frame, text="Send Clipboard to Remote Laptop", command=self.toggle_send_clipboard_remote
         )
         self.send_remote_btn.pack(side="left")
+        self.relay_status_label = tk.Label(self.send_container, text="Relay: Off", fg="gray", anchor="w")
+        self.relay_status_label.pack(fill="x", padx=10, pady=(0, 6))
 
-        tk.Label(root, text=f"Pause/Resume hotkey: {PAUSE_HOTKEY} (works from any app)", fg="gray").pack(
-            anchor="w", padx=10, pady=(0, 4)
-        )
         self.status_label = tk.Label(root, text="Idle", anchor="w")
-        self.status_label.pack(fill="x", padx=10, pady=(0, 10))
+        self.status_label.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
 
         self.typer = AutoTyper()
         self.paused = False
@@ -399,7 +424,36 @@ class App:
         threading.Thread(target=self.clipboard_watch_loop, daemon=True).start()
         threading.Thread(target=self.remote_watch_loop, daemon=True).start()
         threading.Thread(target=self.clipboard_to_remote_loop, daemon=True).start()
+        threading.Thread(target=self.relay_health_loop, daemon=True).start()
         keyboard.add_hotkey(PAUSE_HOTKEY, self.on_pause_hotkey, suppress=True)
+
+    # ---- mode switch ----
+
+    def on_mode_change(self):
+        mode = self.mode_var.get()
+        if mode == "type":
+            if self.send_clipboard_remote_enabled:
+                self.send_clipboard_remote_enabled = False
+                self.send_remote_btn.config(text="Send Clipboard to Remote Laptop")
+            self.send_container.pack_forget()
+            self.type_container.pack(fill="x")
+            self.status_label.config(text="Idle")
+        else:
+            # Leaving "type" mode - stop anything that would otherwise keep
+            # running invisibly with its controls hidden.
+            self.typer.stop()
+            self.reset_button_states()
+            if self.clipboard_watch_enabled:
+                self.clipboard_watch_enabled = False
+                self.watch_btn.config(text="Enable Clipboard Auto-Type")
+                self.file_path_entry.config(state="normal")
+                self.browse_btn.config(state="normal")
+            if self.remote_watch_enabled:
+                self.remote_watch_enabled = False
+                self.remote_btn.config(text="Enable Web Remote Trigger")
+            self.type_container.pack_forget()
+            self.send_container.pack(fill="x")
+            self.status_label.config(text="Idle")
 
     # ---- pause/stop controls ----
 
@@ -507,14 +561,14 @@ class App:
                 # UI would keep saying "Watching..." while doing nothing.
                 self.on_status(f"Clipboard watcher error: {exc}")
 
-    def handle_new_clipboard_text(self, text, wpm=None):
-        """Attempts to start typing `text` into Notepad. Returns True only if
-        a typing job was actually started - the caller uses this to decide
-        whether this clipboard content may be safely considered "handled",
-        so a transient failure gets retried on the next poll instead of
-        being silently and permanently ignored. `wpm` defaults to the speed
-        slider; the remote trigger passes REMOTE_WPM instead since that's
-        meant to appear almost instantly rather than at a natural pace."""
+    def handle_new_clipboard_text(self, text):
+        """Attempts to start typing `text` into Notepad, at the speed
+        slider's current setting - remote-triggered jobs use this same
+        speed, not a separate fixed pace. Returns True only if a typing job
+        was actually started - the caller uses this to decide whether this
+        clipboard content may be safely considered "handled", so a
+        transient failure gets retried on the next poll instead of being
+        silently and permanently ignored."""
         tokens = tokenize(text)
         if not any(is_word for is_word, _ in tokens):
             return True  # nothing to type, but not a failure - don't retry it
@@ -551,7 +605,7 @@ class App:
         self.root.after(0, self.set_controls_running)
         self.typer.start(
             tokens,
-            wpm if wpm is not None else self.wpm_var.get(),
+            self.wpm_var.get(),
             self.on_status,
             self.on_progress,
             self.on_done_auto,
@@ -587,19 +641,21 @@ class App:
         backoff = 1.0
         while True:
             if not self.remote_watch_enabled or self.remote_config is None:
+                self.set_remote_status("Not configured" if self.remote_config is None else "Off")
                 time.sleep(0.5)
                 continue
             topic = self.remote_config["topic"]
             secret = self.remote_config["secret"]
             url = f"{NTFY_BASE_URL}/{topic}/sse"
             try:
+                self.set_remote_status("Connecting...")
                 # (connect_timeout, read_timeout) - ntfy sends a keepalive
                 # roughly every 45s, so a long read timeout would otherwise
                 # look identical to a genuinely dead connection.
                 with requests.get(url, stream=True, timeout=(10, 90)) as resp:
                     resp.raise_for_status()
                     backoff = 1.0
-                    self.on_status("Web remote trigger connected - waiting for text from the portal...")
+                    self.set_remote_status("Connected")
                     for line in resp.iter_lines(decode_unicode=True):
                         if not self.remote_watch_enabled:
                             break
@@ -623,10 +679,10 @@ class App:
                         text = payload.get("text", "")
                         if not text or self.typer.is_running():
                             continue  # a job is already active - see clipboard_watch_loop
-                        self.handle_new_clipboard_text(text, wpm=REMOTE_WPM)
+                        self.handle_new_clipboard_text(text)
             except Exception as exc:
                 if self.remote_watch_enabled:
-                    self.on_status(f"Web remote trigger disconnected ({exc}) - retrying...")
+                    self.set_remote_status(f"Disconnected ({exc}) - retrying...")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
@@ -651,6 +707,29 @@ class App:
         else:
             self.send_remote_btn.config(text="Send Clipboard to Remote Laptop")
             self.status_label.config(text="Stopped sending clipboard to remote laptop.")
+
+    def relay_health_loop(self):
+        """Keeps the "send" mode's Relay status label current. Sending is
+        just an occasional POST, not a persistent connection like the
+        receiving side's SSE stream, so there's nothing to react to as it
+        happens - instead this periodically checks that the relay is
+        actually reachable, purely so switching to "send" mode shows
+        something meaningful before you've copied anything yet."""
+        while True:
+            if self.remote_config is None:
+                self.set_relay_status("Not configured")
+                time.sleep(2)
+                continue
+            if self.mode_var.get() != "send":
+                self.set_relay_status("Off")
+                time.sleep(1)
+                continue
+            try:
+                requests.head(NTFY_BASE_URL, timeout=5)
+                self.set_relay_status("Reachable")
+            except Exception:
+                self.set_relay_status("Unreachable - check your internet connection")
+            time.sleep(8)
 
     def clipboard_to_remote_loop(self):
         while True:
@@ -712,6 +791,12 @@ class App:
 
     def on_status(self, text):
         self.root.after(0, lambda: self.status_label.config(text=text))
+
+    def set_remote_status(self, text):
+        self.root.after(0, lambda: self.remote_status_label.config(text=f"Remote trigger: {text}"))
+
+    def set_relay_status(self, text):
+        self.root.after(0, lambda: self.relay_status_label.config(text=f"Relay: {text}"))
 
     def on_progress(self, done, total):
         self.root.after(0, lambda: self.status_label.config(text=f"Typing... {done}/{total} words"))

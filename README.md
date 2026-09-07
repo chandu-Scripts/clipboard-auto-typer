@@ -14,7 +14,8 @@ Copy text anywhere — an AI response, a document, dictated text — and it appe
 - **Reliable by construction**: text is written directly into Notepad's text control via Windows UI Automation rather than simulated keystrokes, so it can't drop or corrupt characters, and doesn't depend on which window happens to have focus at any given instant.
 - **Works with both** the modern Windows 11 (Store) Notepad and the classic `notepad.exe`.
 - Auto-launches Notepad with your chosen file if it isn't already open.
-- **Web remote trigger**: paste text into a small web page from any device (another laptop, your phone) and it types into Notepad on this machine within a second or two — see [Web Remote Trigger](#web-remote-trigger) below.
+- **Web remote trigger**: paste text into a small web page from any device (another laptop, your phone) and it types into Notepad on this machine within a second or two, at your same speed slider — see [Web Remote Trigger](#web-remote-trigger) below.
+- **Mode switch**: each install of the app is either **Types** (writes to a local Notepad file) or **Sends** (relays its clipboard to another laptop in Types mode) — only the controls relevant to that role are shown, and a status line shows whether the relay connection is actually alive.
 
 ## Requirements
 
@@ -56,7 +57,7 @@ The app polls the clipboard for changes on a background thread. When new text is
 
 ## Web Remote Trigger
 
-Copy-paste normally only works on the same machine. To trigger typing from another device entirely (a second laptop, your phone), the app can also listen for text sent from a small web page, relayed through [ntfy.sh](https://ntfy.sh) — a free, no-signup pub/sub service. Unlike the clipboard flow, remote-triggered text is written almost instantly rather than at your chosen WPM.
+Copy-paste normally only works on the same machine. To trigger typing from another device entirely (a second laptop, your phone), the app can also listen for text sent from a small web page, relayed through [ntfy.sh](https://ntfy.sh) — a free, no-signup pub/sub service. Remote-triggered text types at the same speed as your WPM slider.
 
 ### One-time setup
 
@@ -76,20 +77,20 @@ Copy-paste normally only works on the same machine. To trigger typing from anoth
 
 ### Using it
 
-1. In the app, set your Notepad file path and click **Enable Web Remote Trigger**.
+1. In the app, make sure **This laptop: Types** is selected, set your Notepad file path, and click **Enable Web Remote Trigger**. The "Remote trigger:" line below it shows **Connected** once the relay link is live.
 2. On any device, open `portal.html`, paste your paragraph, and click **Send to Notepad**.
-3. Within a second or two, it appears in Notepad on this laptop — no clipboard, cable, or shared network required, just an internet connection on both ends.
+3. Within a second or two, it appears in Notepad on this laptop, at your speed slider's pace — no clipboard, cable, or shared network required, just an internet connection on both ends.
 
 ### Laptop-to-laptop, hands-free
 
 If the "other device" is a second Windows laptop running this same app, you don't need `portal.html` at all — copying on one laptop can automatically type into Notepad on the other:
 
 1. Copy `remote_config.json` (same file, same topic/secret) onto the second laptop's copy of this project.
-2. On the **receiving** laptop: set the Notepad file path, click **Enable Web Remote Trigger**.
-3. On the **sending** laptop: click **Send Clipboard to Remote Laptop**.
-4. Copy anything on the sending laptop — it appears on the receiving laptop's Notepad within a second or two.
+2. On the **receiving** laptop: select **This laptop: Types**, set the Notepad file path, click **Enable Web Remote Trigger**.
+3. On the **sending** laptop: select **This laptop: Sends**, click **Send Clipboard to Remote Laptop**. The "Relay:" line shows **Reachable** once it can reach the network.
+4. Copy anything on the sending laptop — it appears on the receiving laptop's Notepad within a second or two, at the receiving laptop's speed slider setting.
 
-Don't enable both "Enable Web Remote Trigger" and "Send Clipboard to Remote Laptop" on the *same* laptop with the same config — it would receive and try to type its own outgoing messages.
+Switching a laptop's mode automatically turns off whatever the other mode's controls were doing (e.g. selecting **Sends** stops **Enable Web Remote Trigger** if it was on), since that laptop can only really play one role at a time with a given `remote_config.json`.
 
 ## License
 

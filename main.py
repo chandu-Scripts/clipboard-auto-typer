@@ -413,6 +413,18 @@ class App:
         # ---- "send" mode controls ----
         self.send_container = tk.Frame(root)
 
+        # Only meaningful for a phone/browser receiver (portal.html) - a
+        # laptop receiver always types at its own WPM slider regardless of
+        # this value, since Notepad typing speed is controlled there, not
+        # here (see handle_new_clipboard_text).
+        phone_speed_frame = tk.Frame(self.send_container)
+        phone_speed_frame.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(phone_speed_frame, text="Phone typing speed (WPM):").pack(side="left")
+        self.phone_wpm_var = tk.IntVar(value=80)
+        tk.Scale(
+            phone_speed_frame, from_=20, to=300, orient="horizontal", variable=self.phone_wpm_var, length=200
+        ).pack(side="left", padx=(4, 20))
+
         send_remote_frame = tk.Frame(self.send_container)
         send_remote_frame.pack(fill="x", padx=10, pady=(0, 2))
         self.send_remote_btn = tk.Button(
@@ -772,9 +784,12 @@ class App:
                     continue
                 topic = self.remote_config["topic"]
                 secret = self.remote_config["secret"]
+                # "wpm" only matters to a phone/browser receiver (see
+                # portal.html) - a laptop receiver ignores it and uses its
+                # own WPM slider instead.
                 resp = requests.post(
                     f"{NTFY_BASE_URL}/{topic}",
-                    data=json.dumps({"secret": secret, "text": current}),
+                    data=json.dumps({"secret": secret, "text": current, "wpm": self.phone_wpm_var.get()}),
                     headers={"Content-Type": "text/plain"},
                     timeout=10,
                 )

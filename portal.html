@@ -103,6 +103,26 @@
   #connStatus.ok { color: var(--ok); }
   #connStatus.err { color: var(--err); }
   #receivedArea { min-height: 300px; background: transparent; }
+  #fullscreenView {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+  }
+  #fullscreenView[hidden] { display: none; }
+  #exitFullscreenBtn { align-self: flex-end; width: auto; padding: 8px 16px; margin-bottom: 12px; }
+  #fullscreenText {
+    flex: 1;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    color: var(--text);
+    font-size: clamp(1.3rem, 4vw, 2.6rem);
+    line-height: 1.5;
+  }
 </style>
 </head>
 <body>
@@ -140,8 +160,16 @@
     <h2>Received text</h2>
     <div id="connStatus">Off</div>
     <textarea id="receivedArea" readonly placeholder="Text sent from a laptop will appear here..."></textarea>
-    <button class="secondary" id="clearReceivedBtn" type="button" style="width:100%">Clear</button>
+    <div class="row" style="gap:10px">
+      <button class="secondary" id="fullscreenBtn" type="button" style="width:100%">Full Screen</button>
+      <button class="secondary" id="clearReceivedBtn" type="button" style="width:100%">Clear</button>
+    </div>
   </div>
+</div>
+
+<div id="fullscreenView" hidden>
+  <button id="exitFullscreenBtn" type="button">✕ Exit</button>
+  <div id="fullscreenText"></div>
 </div>
 
 <script>
@@ -244,17 +272,97 @@
       let payload;
       try { payload = JSON.parse(outer.message); } catch { return; }
       if (payload.secret !== secret || !payload.text) return;
-      appendReceived(payload.text);
+      const wpm = Number(payload.wpm) > 0 ? Number(payload.wpm) : 80;
+      appendReceived(payload.text, wpm);
     };
   }
 
-  function appendReceived(text) {
-    receivedArea.value = receivedArea.value ? receivedArea.value + ENTRY_SEPARATOR + text : text;
+  // ---- paced typing animation ----
+  // Mirrors the laptop app's behavior: a new entry doesn't clear anything
+  // - whatever was already revealed (even mid-animation, from an
+  // interrupted entry) is frozen as-is, then ENTRY_SEPARATOR plus the new
+  // entry starts revealing word-by-word at the sender's chosen WPM.
+
+  let animTimer = null;
+  let baseText = '';
+
+  function stopAnimation() {
+    if (animTimer) {
+      clearInterval(animTimer);
+      animTimer = null;
+    }
+  }
+
+  function renderDisplay(text) {
+    receivedArea.value = text;
     receivedArea.scrollTop = receivedArea.scrollHeight;
+    if (!fullscreenView.hidden) {
+      fullscreenText.textContent = text;
+      fullscreenText.scrollTop = fullscreenText.scrollHeight;
+    }
+  }
+
+  function appendReceived(text, wpm) {
+    stopAnimation();
+    baseText = receivedArea.value ? receivedArea.value + ENTRY_SEPARATOR : '';
+    renderDisplay(baseText);
+
+    // Each chunk is one word plus its trailing whitespace, so stepping
+    // through chunks at a fixed interval directly matches the requested
+    // WPM (unlike stepping through raw \S+|\s+ tokens, which would waste
+    // an extra step - and extra time - on pure-whitespace runs).
+    const leadingMatch = text.match(/^\s+/);
+    const leading = leadingMatch ? leadingMatch[0] : '';
+    const chunks = text.slice(leading.length).match(/\S+\s*/g) || [];
+    const intervalMs = Math.max(15, (60 / wpm) * 1000);
+
+    let revealed = leading;
+    let i = 0;
+    animTimer = setInterval(() => {
+      if (i >= chunks.length) {
+        stopAnimation();
+        return;
+      }
+      revealed += chunks[i];
+      i += 1;
+      renderDisplay(baseText + revealed);
+    }, intervalMs);
   }
 
   clearReceivedBtn.addEventListener('click', () => {
+    stopAnimation();
+    baseText = '';
     receivedArea.value = '';
+    if (!fullscreenView.hidden) fullscreenText.textContent = '';
+  });
+
+  // ---- full screen ----
+
+  const fullscreenView = document.getElementById('fullscreenView');
+  const fullscreenText = document.getElementById('fullscreenText');
+  const fullscreenBtn = document.getElementById('fullscreenBtn');
+  const exitFullscreenBtn = document.getElementById('exitFullscreenBtn');
+
+  fullscreenBtn.addEventListener('click', async () => {
+    fullscreenView.hidden = false;
+    fullscreenText.textContent = receivedArea.value;
+    fullscreenText.scrollTop = fullscreenText.scrollHeight;
+    // Best-effort - iOS Safari doesn't support the Fullscreen API on
+    // iPhone at all, so the CSS overlay (which already fills the whole
+    // viewport) is what actually delivers the "full screen" look there;
+    // this just hides the browser chrome too where it's supported.
+    try {
+      await document.documentElement.requestFullscreen();
+    } catch {}
+  });
+
+  exitFullscreenBtn.addEventListener('click', () => {
+    fullscreenView.hidden = true;
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  });
+
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement) fullscreenView.hidden = true;
   });
 
   function applyMode() {

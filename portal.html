@@ -95,14 +95,26 @@
   #status { min-height: 1.2em; font-size: 0.85rem; margin-top: 10px; }
   #status.ok { color: var(--ok); }
   #status.err { color: var(--err); }
-  #settingsCard[hidden] { display: none; }
+  #settingsCard[hidden], #sendCard[hidden], #receiveCard[hidden] { display: none; }
   .settingsToggle { text-align: right; margin-bottom: 8px; }
+  .modeRow { display: flex; align-items: center; gap: 16px; margin-bottom: 16px; font-size: 0.9rem; }
+  .modeRow label { display: flex; align-items: center; gap: 6px; margin-bottom: 0; color: var(--text); cursor: pointer; }
+  #connStatus { font-size: 0.85rem; margin-bottom: 10px; color: var(--muted); }
+  #connStatus.ok { color: var(--ok); }
+  #connStatus.err { color: var(--err); }
+  #receivedArea { min-height: 300px; background: transparent; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Remote Typer</h1>
-  <p class="sub">Paste a paragraph and send it — it will start typing into Notepad on your laptop within a couple of seconds.</p>
+  <p class="sub" id="subtitle">Paste a paragraph and send it — it will start typing into Notepad on your laptop within a couple of seconds.</p>
+
+  <div class="modeRow">
+    <span>This device:</span>
+    <label><input type="radio" name="mode" value="send" checked> Sends</label>
+    <label><input type="radio" name="mode" value="receive"> Receives</label>
+  </div>
 
   <div class="settingsToggle">
     <button class="secondary" id="settingsBtn" type="button">Settings</button>
@@ -117,11 +129,18 @@
     <button id="saveBtn" type="button">Save on this device</button>
   </div>
 
-  <div class="card">
+  <div class="card" id="sendCard">
     <h2>Text to type</h2>
     <textarea id="text" placeholder="Paste your paragraph here..."></textarea>
     <button id="sendBtn" type="button">Send to Notepad</button>
     <div id="status"></div>
+  </div>
+
+  <div class="card" id="receiveCard" hidden>
+    <h2>Received text</h2>
+    <div id="connStatus">Off</div>
+    <textarea id="receivedArea" readonly placeholder="Text sent from a laptop will appear here..."></textarea>
+    <button class="secondary" id="clearReceivedBtn" type="button" style="width:100%">Clear</button>
   </div>
 </div>
 
@@ -134,6 +153,18 @@
   const textArea = document.getElementById('text');
   const sendBtn = document.getElementById('sendBtn');
   const statusEl = document.getElementById('status');
+  const subtitle = document.getElementById('subtitle');
+  const sendCard = document.getElementById('sendCard');
+  const receiveCard = document.getElementById('receiveCard');
+  const connStatusEl = document.getElementById('connStatus');
+  const receivedArea = document.getElementById('receivedArea');
+  const clearReceivedBtn = document.getElementById('clearReceivedBtn');
+  const modeRadios = document.querySelectorAll('input[name="mode"]');
+
+  // Same divider convention as the laptop app's Notepad output (see
+  // ENTRY_SEPARATOR in main.py) - a full dashed line plus a blank line
+  // between entries, since nothing here gets cleared automatically either.
+  const ENTRY_SEPARATOR = '\n' + '-'.repeat(40) + '\n\n';
 
   function loadSettings() {
     topicInput.value = localStorage.getItem('remoteTyperTopic') || '';
@@ -156,12 +187,99 @@
     localStorage.setItem('remoteTyperSecret', secretInput.value.trim());
     setStatus('Settings saved on this device.', 'ok');
     settingsCard.hidden = true;
+    // Re-apply the current mode so a receiver reconnects with the newly
+    // saved topic/secret instead of whatever it started with.
+    applyMode();
   });
 
   function setStatus(msg, kind) {
     statusEl.textContent = msg;
     statusEl.className = kind || '';
   }
+
+  // ---- mode switch ----
+
+  let eventSource = null;
+
+  function currentMode() {
+    return document.querySelector('input[name="mode"]:checked').value;
+  }
+
+  function setConnStatus(msg, kind) {
+    connStatusEl.textContent = msg;
+    connStatusEl.className = kind || '';
+  }
+
+  function disconnectReceiver() {
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+  }
+
+  function connectReceiver() {
+    disconnectReceiver();
+    const topic = topicInput.value.trim();
+    const secret = secretInput.value.trim();
+    if (!topic || !secret) {
+      setConnStatus('Set Topic and Secret key in Settings first.', 'err');
+      settingsCard.hidden = false;
+      return;
+    }
+    setConnStatus('Connecting...', '');
+    eventSource = new EventSource('https://ntfy.sh/' + encodeURIComponent(topic) + '/sse');
+    eventSource.onopen = () => setConnStatus('Connected', 'ok');
+    eventSource.onerror = () => {
+      if (currentMode() === 'receive') setConnStatus('Disconnected — retrying...', 'err');
+    };
+    // No explicit `event:` field on ntfy's actual message deliveries (only
+    // on housekeeping ones like "open"/"keepalive"), so they arrive as the
+    // default SSE event type and land here - same reasoning as
+    // remote_watch_loop in main.py, which filters on the JSON body's own
+    // "event" field rather than the SSE-level event name.
+    eventSource.onmessage = (event) => {
+      let outer;
+      try { outer = JSON.parse(event.data); } catch { return; }
+      if (outer.event !== 'message') return;
+      let payload;
+      try { payload = JSON.parse(outer.message); } catch { return; }
+      if (payload.secret !== secret || !payload.text) return;
+      appendReceived(payload.text);
+    };
+  }
+
+  function appendReceived(text) {
+    receivedArea.value = receivedArea.value ? receivedArea.value + ENTRY_SEPARATOR + text : text;
+    receivedArea.scrollTop = receivedArea.scrollHeight;
+  }
+
+  clearReceivedBtn.addEventListener('click', () => {
+    receivedArea.value = '';
+  });
+
+  function applyMode() {
+    const mode = currentMode();
+    localStorage.setItem('remoteTyperMode', mode);
+    if (mode === 'send') {
+      subtitle.textContent = 'Paste a paragraph and send it — it will start typing into Notepad on your laptop within a couple of seconds.';
+      sendCard.hidden = false;
+      receiveCard.hidden = true;
+      disconnectReceiver();
+    } else {
+      subtitle.textContent = 'Text sent from a laptop appears below as soon as it arrives.';
+      sendCard.hidden = true;
+      receiveCard.hidden = false;
+      connectReceiver();
+    }
+  }
+
+  modeRadios.forEach((r) => r.addEventListener('change', applyMode));
+
+  const savedMode = localStorage.getItem('remoteTyperMode');
+  if (savedMode === 'receive') {
+    document.querySelector('input[name="mode"][value="receive"]').checked = true;
+  }
+  applyMode();
 
   sendBtn.addEventListener('click', async () => {
     const topic = topicInput.value.trim();

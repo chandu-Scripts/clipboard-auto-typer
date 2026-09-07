@@ -80,6 +80,17 @@ Copy-paste normally only works on the same machine. To trigger typing from anoth
 2. On any device, open `portal.html`, paste your paragraph, and click **Send to Notepad**.
 3. Within a second or two, it appears in Notepad on this laptop — no clipboard, cable, or shared network required, just an internet connection on both ends.
 
+### Laptop-to-laptop, hands-free
+
+If the "other device" is a second Windows laptop running this same app, you don't need `portal.html` at all — copying on one laptop can automatically type into Notepad on the other:
+
+1. Copy `remote_config.json` (same file, same topic/secret) onto the second laptop's copy of this project.
+2. On the **receiving** laptop: set the Notepad file path, click **Enable Web Remote Trigger**.
+3. On the **sending** laptop: click **Send Clipboard to Remote Laptop**.
+4. Copy anything on the sending laptop — it appears on the receiving laptop's Notepad within a second or two.
+
+Don't enable both "Enable Web Remote Trigger" and "Send Clipboard to Remote Laptop" on the *same* laptop with the same config — it would receive and try to type its own outgoing messages.
+
 ## License
 
 [MIT](LICENSE)

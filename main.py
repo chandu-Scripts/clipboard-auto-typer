@@ -16,7 +16,12 @@ import win32con
 import win32gui
 import win32process
 
-CLIPBOARD_POLL_SECONDS = 0.4
+CLIPBOARD_POLL_SECONDS = 0.15
+
+# Inserted between an old (possibly interrupted, mid-sentence) entry and a
+# newly started one, since entries are no longer cleared - "---" makes the
+# cutoff point visually obvious rather than just a plain blank line.
+ENTRY_SEPARATOR = "\n---\n"
 # Avoid letters (ctrl+<letter> can leak through as a real shortcut on a
 # mistimed press - ctrl+alt+p briefly looking like ctrl+p = Print was exactly
 # that) and avoid F10 (Windows treats it as a special system key that can
@@ -142,12 +147,12 @@ class AutoTyper:
         self.stop_flag = threading.Event()
         self.thread = None
 
-    def start(self, tokens, wpm, on_status, on_progress, on_done, target_hwnd):
+    def start(self, tokens, wpm, on_status, on_progress, on_done, target_hwnd, prefix=""):
         self.stop_flag.clear()
         self.running_event.set()
         self.thread = threading.Thread(
             target=self._run,
-            args=(tokens, wpm, on_status, on_progress, on_done, target_hwnd),
+            args=(tokens, wpm, on_status, on_progress, on_done, target_hwnd, prefix),
             daemon=True,
         )
         self.thread.start()
@@ -170,7 +175,7 @@ class AutoTyper:
     def is_running(self):
         return bool(self.thread and self.thread.is_alive())
 
-    def _run(self, tokens, wpm, on_status, on_progress, on_done, target_hwnd):
+    def _run(self, tokens, wpm, on_status, on_progress, on_done, target_hwnd, prefix=""):
         # UI Automation must be explicitly initialized on every thread that
         # uses it, per the uiautomation library's own docs - without this,
         # UIA/Control/Pattern calls made from a spawned thread (this one)
@@ -190,7 +195,12 @@ class AutoTyper:
             on_status("Could not find Notepad's text area.")
             return
 
-        written_parts = []
+        # `prefix` carries whatever was already in Notepad (plus
+        # ENTRY_SEPARATOR) - entries are no longer cleared between jobs, so
+        # each flush rewrites prior content verbatim alongside the new
+        # text. done_words/total_words below count only the new tokens,
+        # not anything already in prefix.
+        written_parts = [prefix] if prefix else []
         done_words = 0
         words_since_flush = 0
 
@@ -533,8 +543,9 @@ class App:
 
     def clipboard_watch_loop(self):
         # Same reason as in AutoTyper._run - this is a spawned thread, and
-        # this thread also makes UI Automation calls directly (clearing
-        # Notepad before a new job starts), so it needs its own init too.
+        # this thread also makes UI Automation calls directly (reading
+        # Notepad's existing text before a new job starts), so it needs its
+        # own init too.
         auto.InitializeUIAutomationInCurrentThread()
         while True:
             time.sleep(CLIPBOARD_POLL_SECONDS)
@@ -575,11 +586,14 @@ class App:
     def handle_new_clipboard_text(self, text):
         """Attempts to start typing `text` into Notepad, at the speed
         slider's current setting - remote-triggered jobs use this same
-        speed, not a separate fixed pace. Returns True only if a typing job
-        was actually started - the caller uses this to decide whether this
-        clipboard content may be safely considered "handled", so a
-        transient failure gets retried on the next poll instead of being
-        silently and permanently ignored."""
+        speed, not a separate fixed pace. Appends after whatever's already
+        there (separated by ENTRY_SEPARATOR) rather than clearing it first -
+        if a prior job was interrupted mid-sentence (see remote_watch_loop),
+        that partial text is left exactly as it was, not wiped. Returns True
+        only if a typing job was actually started - the caller uses this to
+        decide whether this clipboard content may be safely considered
+        "handled", so a transient failure gets retried on the next poll
+        instead of being silently and permanently ignored."""
         tokens = tokenize(text)
         if not any(is_word for is_word, _ in tokens):
             return True  # nothing to type, but not a failure - don't retry it
@@ -594,20 +608,17 @@ class App:
         if not self.ensure_notepad_open(file_path):
             return False
 
-        # Clear via UI Automation rather than Ctrl+A/Delete keystrokes - it
-        # doesn't depend on Notepad actually having focus at this exact
-        # moment to land correctly. Bringing Notepad to the foreground is
-        # now just a nicety (so the user sees typing start if they're
-        # looking), not something the clear itself depends on.
         value_pattern = get_notepad_value_pattern(self.notepad_hwnd)
         if value_pattern is None:
             self.on_status("Could not find Notepad's text area - will retry.")
             return False
         try:
-            value_pattern.SetValue("")
+            existing = value_pattern.Value or ""
         except Exception as exc:
-            self.on_status(f"Could not clear Notepad: {exc} - will retry.")
+            self.on_status(f"Could not read Notepad's current text: {exc} - will retry.")
             return False
+        prefix = existing + ENTRY_SEPARATOR if existing.strip() else ""
+
         try:
             force_foreground(self.notepad_hwnd)
         except Exception:
@@ -620,6 +631,7 @@ class App:
             self.on_status,
             self.on_progress,
             self.on_done_auto,
+            prefix=prefix,
             target_hwnd=self.notepad_hwnd,
         )
         return True

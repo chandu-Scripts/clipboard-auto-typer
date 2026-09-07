@@ -221,7 +221,18 @@ class AutoTyper:
                     return
                 words_since_flush = 0
                 target_duration = seconds_per_word * words_per_batch
-                time.sleep(max(0, target_duration - (time.time() - call_start)))
+                # stop_flag.wait() instead of time.sleep(): at slow WPM this
+                # pacing delay can be several seconds, long enough that a
+                # plain sleep would make stop() take just as long to take
+                # effect - which matters now that a new remote-triggered
+                # job stops whatever's currently typing (see
+                # remote_watch_loop) rather than waiting for it to finish.
+                # wait() returns the instant stop() sets the flag, so the
+                # next loop iteration's _wait_until_ready check (which
+                # reports "Stopped") fires almost immediately instead of up
+                # to one whole batch-interval late - the gap that let two
+                # typing threads briefly run at once and corrupt Notepad.
+                self.stop_flag.wait(max(0, target_duration - (time.time() - call_start)))
 
         if not flush():  # final flush for any remaining tail (last partial batch, trailing whitespace)
             return
@@ -677,8 +688,14 @@ class App:
                         if payload.get("secret") != secret:
                             continue
                         text = payload.get("text", "")
-                        if not text or self.typer.is_running():
-                            continue  # a job is already active - see clipboard_watch_loop
+                        if not text:
+                            continue
+                        # Unlike the local clipboard flow, a new remote copy
+                        # is meant to immediately replace whatever's
+                        # currently typing rather than wait for it to
+                        # finish - handle_new_clipboard_text already calls
+                        # typer.stop_and_wait() before starting, so this
+                        # just lets that happen instead of skipping.
                         self.handle_new_clipboard_text(text)
             except Exception as exc:
                 if self.remote_watch_enabled:

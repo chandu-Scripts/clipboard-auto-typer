@@ -330,7 +330,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Clipboard Auto Typer")
-        root.geometry("560x270")
+        root.geometry("560x300")
 
         path_frame = tk.Frame(root)
         path_frame.pack(fill="x", padx=10, pady=(12, 6))
@@ -365,6 +365,13 @@ class App:
         self.remote_btn = tk.Button(remote_frame, text="Enable Web Remote Trigger", command=self.toggle_remote_watch)
         self.remote_btn.pack(side="left")
 
+        send_remote_frame = tk.Frame(root)
+        send_remote_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self.send_remote_btn = tk.Button(
+            send_remote_frame, text="Send Clipboard to Remote Laptop", command=self.toggle_send_clipboard_remote
+        )
+        self.send_remote_btn.pack(side="left")
+
         tk.Label(root, text=f"Pause/Resume hotkey: {PAUSE_HOTKEY} (works from any app)", fg="gray").pack(
             anchor="w", padx=10, pady=(0, 4)
         )
@@ -382,11 +389,16 @@ class App:
         self.remote_watch_enabled = False
         if self.remote_config is None:
             self.remote_btn.config(state="disabled")
+            self.send_remote_btn.config(state="disabled")
+
+        self.send_clipboard_remote_enabled = False
+        self.last_sent_clipboard_text = ""
 
         self.last_hotkey_time = 0.0
 
         threading.Thread(target=self.clipboard_watch_loop, daemon=True).start()
         threading.Thread(target=self.remote_watch_loop, daemon=True).start()
+        threading.Thread(target=self.clipboard_to_remote_loop, daemon=True).start()
         keyboard.add_hotkey(PAUSE_HOTKEY, self.on_pause_hotkey, suppress=True)
 
     # ---- pause/stop controls ----
@@ -617,6 +629,54 @@ class App:
                     self.on_status(f"Web remote trigger disconnected ({exc}) - retrying...")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
+
+    # ---- send-clipboard-to-remote-laptop flow ----
+    # This is the mirror image of remote_watch_loop: instead of THIS laptop
+    # receiving text posted from the web portal, THIS laptop watches its own
+    # clipboard and auto-relays new copies to the same ntfy topic, so
+    # another laptop running this same app with "Enable Web Remote Trigger"
+    # on picks it up and types it - no manual paste-into-portal.html step
+    # needed. Both laptops must share the same remote_config.json (topic +
+    # secret); copy that file over once when setting this up.
+
+    def toggle_send_clipboard_remote(self):
+        if self.remote_config is None:
+            self.status_label.config(text="Remote trigger not configured - see remote_config.json.")
+            return
+        self.send_clipboard_remote_enabled = not self.send_clipboard_remote_enabled
+        if self.send_clipboard_remote_enabled:
+            self.send_remote_btn.config(text="Stop Sending Clipboard to Remote Laptop")
+            self.last_sent_clipboard_text = self.safe_paste()
+            self.status_label.config(text="Sending clipboard copies to the remote laptop...")
+        else:
+            self.send_remote_btn.config(text="Send Clipboard to Remote Laptop")
+            self.status_label.config(text="Stopped sending clipboard to remote laptop.")
+
+    def clipboard_to_remote_loop(self):
+        while True:
+            time.sleep(CLIPBOARD_POLL_SECONDS)
+            if not self.send_clipboard_remote_enabled or self.remote_config is None:
+                continue
+            try:
+                current = self.safe_paste()
+                if not current or current == self.last_sent_clipboard_text:
+                    continue
+                topic = self.remote_config["topic"]
+                secret = self.remote_config["secret"]
+                resp = requests.post(
+                    f"{NTFY_BASE_URL}/{topic}",
+                    data=json.dumps({"secret": secret, "text": current}),
+                    headers={"Content-Type": "text/plain"},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                # Only mark as sent on success - same reasoning as
+                # clipboard_watch_loop: a transient network failure should
+                # retry on the next poll rather than being silently dropped.
+                self.last_sent_clipboard_text = current
+                self.on_status("Sent to remote laptop.")
+            except Exception as exc:
+                self.on_status(f"Could not reach remote relay: {exc} - will retry.")
 
     def ensure_notepad_open(self, file_path):
         filename = os.path.basename(file_path)

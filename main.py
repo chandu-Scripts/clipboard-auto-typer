@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -8,6 +9,7 @@ from tkinter import filedialog
 
 import keyboard
 import pyperclip
+import requests
 import uiautomation as auto
 import win32api
 import win32con
@@ -44,7 +46,40 @@ HOTKEY_DEBOUNCE_SECONDS = 0.5
 # the requested WPM without calling more often than that can support.
 UIA_CALL_INTERVAL_SECONDS = 0.5
 
+# Jobs triggered from the web portal (see remote_watch_loop) are meant to
+# appear almost instantly rather than at a natural typing pace, so they run
+# at this fixed high WPM instead of whatever the speed slider is set to.
+REMOTE_WPM = 1000
+
+# Text sent from the web portal is relayed through ntfy.sh (a free, public
+# pub/sub service - see https://ntfy.sh): the portal POSTs to a topic, this
+# app subscribes to that same topic over Server-Sent Events. The topic name
+# alone is not a real secret (anyone who guesses/finds it could subscribe),
+# so every message also carries a shared secret that must match
+# remote_config.json - see remote_config.example.json for the format. That
+# file is gitignored; it's generated per-install, never committed.
+NTFY_BASE_URL = "https://ntfy.sh"
+REMOTE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "remote_config.json")
+
 TOKEN_PATTERN = re.compile(r"\S+|\s+")
+
+
+def load_remote_config():
+    """Loads the ntfy topic + shared secret used by the web remote trigger.
+    Returns None if the file is missing or malformed, so the feature is
+    simply unavailable rather than crashing the app - it's optional, and the
+    file deliberately isn't committed to git (see remote_config.example.json)."""
+    if not os.path.exists(REMOTE_CONFIG_PATH):
+        return None
+    try:
+        with open(REMOTE_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        topic, secret = data.get("topic"), data.get("secret")
+        if topic and secret:
+            return {"topic": topic, "secret": secret}
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def tokenize(text):
@@ -295,7 +330,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Clipboard Auto Typer")
-        root.geometry("560x230")
+        root.geometry("560x270")
 
         path_frame = tk.Frame(root)
         path_frame.pack(fill="x", padx=10, pady=(12, 6))
@@ -325,6 +360,11 @@ class App:
         self.watch_btn = tk.Button(watch_frame, text="Enable Clipboard Auto-Type", command=self.toggle_watch)
         self.watch_btn.pack(side="left")
 
+        remote_frame = tk.Frame(root)
+        remote_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self.remote_btn = tk.Button(remote_frame, text="Enable Web Remote Trigger", command=self.toggle_remote_watch)
+        self.remote_btn.pack(side="left")
+
         tk.Label(root, text=f"Pause/Resume hotkey: {PAUSE_HOTKEY} (works from any app)", fg="gray").pack(
             anchor="w", padx=10, pady=(0, 4)
         )
@@ -338,9 +378,15 @@ class App:
         self.last_clipboard_text = ""
         self.notepad_hwnd = None
 
+        self.remote_config = load_remote_config()
+        self.remote_watch_enabled = False
+        if self.remote_config is None:
+            self.remote_btn.config(state="disabled")
+
         self.last_hotkey_time = 0.0
 
         threading.Thread(target=self.clipboard_watch_loop, daemon=True).start()
+        threading.Thread(target=self.remote_watch_loop, daemon=True).start()
         keyboard.add_hotkey(PAUSE_HOTKEY, self.on_pause_hotkey, suppress=True)
 
     # ---- pause/stop controls ----
@@ -449,12 +495,14 @@ class App:
                 # UI would keep saying "Watching..." while doing nothing.
                 self.on_status(f"Clipboard watcher error: {exc}")
 
-    def handle_new_clipboard_text(self, text):
+    def handle_new_clipboard_text(self, text, wpm=None):
         """Attempts to start typing `text` into Notepad. Returns True only if
         a typing job was actually started - the caller uses this to decide
         whether this clipboard content may be safely considered "handled",
         so a transient failure gets retried on the next poll instead of
-        being silently and permanently ignored."""
+        being silently and permanently ignored. `wpm` defaults to the speed
+        slider; the remote trigger passes REMOTE_WPM instead since that's
+        meant to appear almost instantly rather than at a natural pace."""
         tokens = tokenize(text)
         if not any(is_word for is_word, _ in tokens):
             return True  # nothing to type, but not a failure - don't retry it
@@ -491,13 +539,84 @@ class App:
         self.root.after(0, self.set_controls_running)
         self.typer.start(
             tokens,
-            self.wpm_var.get(),
+            wpm if wpm is not None else self.wpm_var.get(),
             self.on_status,
             self.on_progress,
             self.on_done_auto,
             target_hwnd=self.notepad_hwnd,
         )
         return True
+
+    # ---- web remote trigger flow ----
+
+    def toggle_remote_watch(self):
+        if self.remote_config is None:
+            self.status_label.config(text="Remote trigger not configured - see remote_config.json.")
+            return
+        if not self.remote_watch_enabled:
+            file_path = self.file_path_var.get().strip()
+            if not file_path:
+                self.status_label.config(text="Select a Notepad file path first.")
+                return
+            self.remote_watch_enabled = True
+            self.remote_btn.config(text="Disable Web Remote Trigger")
+            self.status_label.config(text="Connecting to web portal relay...")
+            threading.Thread(target=self.prelaunch_notepad, args=(file_path,), daemon=True).start()
+        else:
+            self.remote_watch_enabled = False
+            self.remote_btn.config(text="Enable Web Remote Trigger")
+            self.status_label.config(text="Remote trigger stopped.")
+
+    def remote_watch_loop(self):
+        # Same reason as clipboard_watch_loop/AutoTyper._run - this thread
+        # makes UI Automation calls (via handle_new_clipboard_text), so it
+        # needs its own UIA init too.
+        auto.InitializeUIAutomationInCurrentThread()
+        backoff = 1.0
+        while True:
+            if not self.remote_watch_enabled or self.remote_config is None:
+                time.sleep(0.5)
+                continue
+            topic = self.remote_config["topic"]
+            secret = self.remote_config["secret"]
+            url = f"{NTFY_BASE_URL}/{topic}/sse"
+            try:
+                # (connect_timeout, read_timeout) - ntfy sends a keepalive
+                # roughly every 45s, so a long read timeout would otherwise
+                # look identical to a genuinely dead connection.
+                with requests.get(url, stream=True, timeout=(10, 90)) as resp:
+                    resp.raise_for_status()
+                    backoff = 1.0
+                    self.on_status("Web remote trigger connected - waiting for text from the portal...")
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if not self.remote_watch_enabled:
+                            break
+                        if not line or not line.startswith("data:"):
+                            continue
+                        try:
+                            event = json.loads(line[len("data:"):].strip())
+                        except ValueError:
+                            continue
+                        if event.get("event") != "message":
+                            continue
+                        try:
+                            payload = json.loads(event.get("message", ""))
+                        except ValueError:
+                            continue
+                        # Guards against anyone else who finds/guesses the
+                        # topic name - only messages carrying the matching
+                        # shared secret are ever acted on.
+                        if payload.get("secret") != secret:
+                            continue
+                        text = payload.get("text", "")
+                        if not text or self.typer.is_running():
+                            continue  # a job is already active - see clipboard_watch_loop
+                        self.handle_new_clipboard_text(text, wpm=REMOTE_WPM)
+            except Exception as exc:
+                if self.remote_watch_enabled:
+                    self.on_status(f"Web remote trigger disconnected ({exc}) - retrying...")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
     def ensure_notepad_open(self, file_path):
         filename = os.path.basename(file_path)

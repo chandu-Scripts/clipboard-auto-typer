@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Remote Typer</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --text: #1a1d23;
+    --muted: #6b7280;
+    --border: #d9dce1;
+    --accent: #2563eb;
+    --accent-text: #ffffff;
+    --ok: #15803d;
+    --err: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181d;
+      --card: #1f2228;
+      --text: #e8eaed;
+      --muted: #9aa0a8;
+      --border: #33373f;
+      --accent: #3b82f6;
+      --accent-text: #ffffff;
+      --ok: #4ade80;
+      --err: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 24px 16px 60px;
+  }
+  .wrap { width: 100%; max-width: 560px; }
+  h1 { font-size: 1.25rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 0.85rem; margin: 0 0 20px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .card h2 {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 0 0 10px;
+  }
+  label { display: block; font-size: 0.85rem; margin-bottom: 4px; color: var(--muted); }
+  input[type=text], input[type=password], textarea {
+    width: 100%;
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 0.95rem;
+    font-family: inherit;
+    margin-bottom: 10px;
+  }
+  textarea { min-height: 220px; resize: vertical; line-height: 1.4; }
+  button {
+    width: 100%;
+    background: var(--accent);
+    color: var(--accent-text);
+    border: none;
+    border-radius: 8px;
+    padding: 12px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; cursor: default; }
+  button.secondary {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    font-weight: 500;
+    font-size: 0.85rem;
+    width: auto;
+    padding: 8px 14px;
+  }
+  .row { display: flex; justify-content: space-between; align-items: center; }
+  #status { min-height: 1.2em; font-size: 0.85rem; margin-top: 10px; }
+  #status.ok { color: var(--ok); }
+  #status.err { color: var(--err); }
+  #settingsCard[hidden] { display: none; }
+  .settingsToggle { text-align: right; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Remote Typer</h1>
+  <p class="sub">Paste a paragraph and send it — it will start typing into Notepad on your laptop within a couple of seconds.</p>
+
+  <div class="settingsToggle">
+    <button class="secondary" id="settingsBtn" type="button">Settings</button>
+  </div>
+
+  <div class="card" id="settingsCard" hidden>
+    <h2>Connection</h2>
+    <label for="topic">Topic</label>
+    <input type="text" id="topic" autocomplete="off" placeholder="e.g. 24crG1T271fS">
+    <label for="secret">Secret key</label>
+    <input type="password" id="secret" autocomplete="off" placeholder="shared secret from remote_config.json">
+    <button id="saveBtn" type="button">Save on this device</button>
+  </div>
+
+  <div class="card">
+    <h2>Text to type</h2>
+    <textarea id="text" placeholder="Paste your paragraph here..."></textarea>
+    <button id="sendBtn" type="button">Send to Notepad</button>
+    <div id="status"></div>
+  </div>
+</div>
+
+<script>
+  const topicInput = document.getElementById('topic');
+  const secretInput = document.getElementById('secret');
+  const settingsCard = document.getElementById('settingsCard');
+  const settingsBtn = document.getElementById('settingsBtn');
+  const saveBtn = document.getElementById('saveBtn');
+  const textArea = document.getElementById('text');
+  const sendBtn = document.getElementById('sendBtn');
+  const statusEl = document.getElementById('status');
+
+  function loadSettings() {
+    topicInput.value = localStorage.getItem('remoteTyperTopic') || '';
+    secretInput.value = localStorage.getItem('remoteTyperSecret') || '';
+  }
+  loadSettings();
+
+  // Open settings automatically on first visit (nothing saved yet), so
+  // there's no dead-end screen with a Send button that can't work.
+  if (!topicInput.value || !secretInput.value) {
+    settingsCard.hidden = false;
+  }
+
+  settingsBtn.addEventListener('click', () => {
+    settingsCard.hidden = !settingsCard.hidden;
+  });
+
+  saveBtn.addEventListener('click', () => {
+    localStorage.setItem('remoteTyperTopic', topicInput.value.trim());
+    localStorage.setItem('remoteTyperSecret', secretInput.value.trim());
+    setStatus('Settings saved on this device.', 'ok');
+    settingsCard.hidden = true;
+  });
+
+  function setStatus(msg, kind) {
+    statusEl.textContent = msg;
+    statusEl.className = kind || '';
+  }
+
+  sendBtn.addEventListener('click', async () => {
+    const topic = topicInput.value.trim();
+    const secret = secretInput.value.trim();
+    const text = textArea.value;
+
+    if (!topic || !secret) {
+      setStatus('Set Topic and Secret key in Settings first.', 'err');
+      settingsCard.hidden = false;
+      return;
+    }
+    if (!text.trim()) {
+      setStatus('Nothing to send — paste some text first.', 'err');
+      return;
+    }
+
+    sendBtn.disabled = true;
+    setStatus('Sending...', '');
+    try {
+      const body = JSON.stringify({ secret, text });
+      const resp = await fetch('https://ntfy.sh/' + encodeURIComponent(topic), {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body,
+      });
+      if (!resp.ok) throw new Error('Relay returned ' + resp.status);
+      setStatus('Sent ✓ — check Notepad on your laptop.', 'ok');
+      textArea.value = '';
+    } catch (err) {
+      setStatus('Failed to send: ' + err.message, 'err');
+    } finally {
+      sendBtn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

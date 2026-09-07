@@ -2,3 +2,4 @@ keyboard
 pyperclip
 pywin32
 uiautomation
+requests

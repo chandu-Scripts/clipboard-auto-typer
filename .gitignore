@@ -9,6 +9,9 @@ env/
 # Claude Code local settings
 .claude/
 
+# Remote trigger secret (topic + shared secret) - never commit
+remote_config.json
+
 # OS
 Thumbs.db
 .DS_Store

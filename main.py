@@ -262,7 +262,7 @@ class AutoTyper:
         done_words = 0
         words_since_flush = 0
 
-        def flush():
+        def flush(force_scroll=False):
             if not win32gui.IsWindow(target_hwnd):
                 on_status("Notepad window closed - stopped.")
                 return False
@@ -271,7 +271,19 @@ class AutoTyper:
             except Exception as exc:
                 on_status(f"Could not write to Notepad: {exc}")
                 return False
-            scroll_notepad_to_end(text_pattern)
+            # scroll_notepad_to_end() costs about as much as SetValue()
+            # itself (measured ~1s vs ~0.5s) - calling it from every flush
+            # made high-WPM jobs bottleneck on UI Automation call overhead
+            # instead of actually running at the requested speed (300 WPM
+            # measured at ~100 WPM effective with that approach). Ongoing
+            # scrolling during a job is instead handled off this thread
+            # entirely by App.scroll_follow_loop, which doesn't share this
+            # loop's pacing budget; force_scroll is only True for the very
+            # last flush, so the job still ends with the view definitely
+            # caught up rather than possibly stale until that loop's next
+            # tick.
+            if force_scroll:
+                scroll_notepad_to_end(text_pattern)
             on_progress(done_words, total_words)
             return True
 
@@ -303,7 +315,10 @@ class AutoTyper:
                 # typing threads briefly run at once and corrupt Notepad.
                 self.stop_flag.wait(max(0, target_duration - (time.time() - call_start)))
 
-        if not flush():  # final flush for any remaining tail (last partial batch, trailing whitespace)
+        # Final flush for any remaining tail (last partial batch, trailing
+        # whitespace) - always scrolls regardless of throttling, so the job
+        # never finishes leaving the view stuck at a stale scroll position.
+        if not flush(force_scroll=True):
             return
         on_status("Done")
         on_done()
@@ -517,6 +532,7 @@ class App:
         threading.Thread(target=self.relay_health_loop, daemon=True).start()
         threading.Thread(target=self.heartbeat_sender_loop, daemon=True).start()
         threading.Thread(target=self.connection_status_ticker, daemon=True).start()
+        threading.Thread(target=self.scroll_follow_loop, daemon=True).start()
         keyboard.add_hotkey(PAUSE_HOTKEY, self.on_pause_hotkey, suppress=True)
 
     # ---- mode switch ----
@@ -988,6 +1004,27 @@ class App:
     def prelaunch_notepad(self, file_path):
         if self.ensure_notepad_open(file_path):
             self.on_status("Watching clipboard - copy something to auto-type it into Notepad.")
+
+    def scroll_follow_loop(self):
+        """Keeps Notepad scrolled to follow along during a typing job,
+        independently of AutoTyper's own thread - see the comment in
+        AutoTyper._run's flush() for why scrolling can't just happen
+        inline there without capping effective typing speed well below
+        whatever WPM is configured. Runs continuously regardless of
+        whether a job is active; the text_pattern lookup is cached per
+        window handle so an idle tick (no job running) costs nothing
+        beyond the sleep."""
+        auto.InitializeUIAutomationInCurrentThread()
+        cached_hwnd = None
+        cached_text_pattern = None
+        while True:
+            time.sleep(1.0)
+            if not self.typer.is_running() or self.notepad_hwnd is None:
+                continue
+            if self.notepad_hwnd != cached_hwnd:
+                cached_text_pattern = get_notepad_text_pattern(self.notepad_hwnd, timeout=1.0)
+                cached_hwnd = self.notepad_hwnd
+            scroll_notepad_to_end(cached_text_pattern)
 
     # ---- shared status/control helpers ----
 

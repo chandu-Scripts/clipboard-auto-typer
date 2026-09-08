@@ -101,12 +101,9 @@ def tokenize(text):
     return [(not m.group()[0].isspace(), m.group()) for m in TOKEN_PATTERN.finditer(text)]
 
 
-def get_notepad_value_pattern(hwnd, timeout=5.0):
-    """Finds the UI Automation ValuePattern for a Notepad window's text
-    editor, given its win32 window handle. This lets text be written
-    directly into the control regardless of which window currently has OS
-    focus - unlike keyboard.write()/send(), which always go to whatever
-    window is in the foreground. Returns None if the window or its text
+def find_notepad_text_control(hwnd, timeout=5.0):
+    """Finds the UI Automation control for a Notepad window's text editor,
+    given its win32 window handle. Returns None if the window or its text
     control can no longer be found (e.g. Notepad was closed).
 
     Tries both the modern (Windows 11 Store) Notepad's DocumentControl and
@@ -129,14 +126,59 @@ def get_notepad_value_pattern(hwnd, timeout=5.0):
             for finder in (window_ctrl.DocumentControl, window_ctrl.EditControl):
                 text_ctrl = finder(searchDepth=10)
                 if text_ctrl.Exists(wait):
-                    value_pattern = text_ctrl.GetValuePattern()
-                    if value_pattern is not None:
-                        return value_pattern
+                    return text_ctrl
         except Exception:
             pass
         if time.time() >= deadline:
             return None
         time.sleep(0.2)
+
+
+def get_notepad_value_pattern(hwnd, timeout=5.0):
+    """Finds the UI Automation ValuePattern for a Notepad window's text
+    editor. This lets text be written directly into the control regardless
+    of which window currently has OS focus - unlike keyboard.write()/
+    send(), which always go to whatever window is in the foreground."""
+    text_ctrl = find_notepad_text_control(hwnd, timeout)
+    return text_ctrl.GetValuePattern() if text_ctrl is not None else None
+
+
+def get_notepad_text_pattern(hwnd, timeout=5.0):
+    """Finds the UI Automation TextPattern for a Notepad window's text
+    editor - used to scroll the view to follow newly-written text (see
+    scroll_notepad_to_end), since SetValue() replaces the control's
+    content directly rather than moving a caret through it, so Notepad has
+    no reason to auto-scroll on its own the way it would for real typing."""
+    text_ctrl = find_notepad_text_control(hwnd, timeout)
+    if text_ctrl is None:
+        return None
+    try:
+        return text_ctrl.GetTextPattern()
+    except Exception:
+        return None
+
+
+def scroll_notepad_to_end(text_pattern):
+    """Scrolls Notepad's view so the very end of the document is visible.
+    Called after every UI Automation write (see AutoTyper._run's flush())
+    because SetValue() replaces the control's content directly rather than
+    moving a caret through it the way real typing would - without this,
+    once the text grows past one screen, newly-written text lands below
+    the visible area and stays there until the user manually scrolls
+    down. `text_pattern` may be None (e.g. a Notepad variant that doesn't
+    expose one); this is then a no-op rather than an error, since typing
+    itself doesn't depend on it."""
+    if text_pattern is None:
+        return
+    try:
+        doc_range = text_pattern.DocumentRange
+        end_range = doc_range.Clone()
+        end_range.MoveEndpointByRange(
+            auto.TextPatternRangeEndpoint.Start, doc_range, auto.TextPatternRangeEndpoint.End
+        )
+        end_range.ScrollIntoView(alignTop=False)
+    except Exception:
+        pass  # best-effort - never let a scroll failure interrupt typing
 
 
 class AutoTyper:
@@ -206,6 +248,10 @@ class AutoTyper:
         if value_pattern is None:
             on_status("Could not find Notepad's text area.")
             return
+        # Best-effort - if this particular Notepad variant doesn't expose a
+        # TextPattern for some reason, typing still works, it just won't
+        # auto-scroll to follow long output.
+        text_pattern = get_notepad_text_pattern(target_hwnd)
 
         # `prefix` carries whatever was already in Notepad (plus
         # ENTRY_SEPARATOR) - entries are no longer cleared between jobs, so
@@ -225,6 +271,7 @@ class AutoTyper:
             except Exception as exc:
                 on_status(f"Could not write to Notepad: {exc}")
                 return False
+            scroll_notepad_to_end(text_pattern)
             on_progress(done_words, total_words)
             return True
 

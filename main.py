@@ -63,6 +63,16 @@ UIA_CALL_INTERVAL_SECONDS = 0.5
 NTFY_BASE_URL = "https://ntfy.sh"
 REMOTE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "remote_config.json")
 
+# "Connected"/"Reachable" used to mean only "this laptop can reach ntfy.sh
+# at all", which stayed true even with no laptop on the other end - not a
+# real pairing check. Each side now also sends a small heartbeat message
+# (kind="heartbeat") over the same topic every HEARTBEAT_INTERVAL_SECONDS
+# while its toggle is on; the displayed status only says "Connected" once
+# a heartbeat has actually been seen from the other role within
+# HEARTBEAT_TIMEOUT_SECONDS (see connection_status_ticker).
+HEARTBEAT_INTERVAL_SECONDS = 5
+HEARTBEAT_TIMEOUT_SECONDS = 12
+
 TOKEN_PATTERN = re.compile(r"\S+|\s+")
 
 
@@ -442,12 +452,24 @@ class App:
         self.send_clipboard_remote_enabled = False
         self.last_sent_clipboard_text = ""
 
+        # Heartbeat/pairing state - separate per role so the idle role's
+        # loop (always running, just gated off) can't clobber the active
+        # role's state by both writing the same shared variable.
+        self.type_relay_link_up = False
+        self.type_last_peer_heartbeat = 0.0
+        self.type_last_relay_error = None
+        self.send_relay_link_up = False
+        self.send_last_peer_heartbeat = 0.0
+        self.send_last_relay_error = None
+
         self.last_hotkey_time = 0.0
 
         threading.Thread(target=self.clipboard_watch_loop, daemon=True).start()
         threading.Thread(target=self.remote_watch_loop, daemon=True).start()
         threading.Thread(target=self.clipboard_to_remote_loop, daemon=True).start()
         threading.Thread(target=self.relay_health_loop, daemon=True).start()
+        threading.Thread(target=self.heartbeat_sender_loop, daemon=True).start()
+        threading.Thread(target=self.connection_status_ticker, daemon=True).start()
         keyboard.add_hotkey(PAUSE_HOTKEY, self.on_pause_hotkey, suppress=True)
 
     # ---- mode switch ----
@@ -650,6 +672,10 @@ class App:
                 self.status_label.config(text="Select a Notepad file path first.")
                 return
             self.remote_watch_enabled = True
+            # Reset so a stale heartbeat from before this was last enabled
+            # can't make the status say "Connected" before a fresh one has
+            # actually been seen.
+            self.type_last_peer_heartbeat = 0.0
             self.remote_btn.config(text="Disable Web Remote Trigger")
             self.status_label.config(text="Connecting to relay...")
             threading.Thread(target=self.prelaunch_notepad, args=(file_path,), daemon=True).start()
@@ -666,21 +692,21 @@ class App:
         backoff = 1.0
         while True:
             if not self.remote_watch_enabled or self.remote_config is None:
-                self.set_remote_status("Not configured" if self.remote_config is None else "Off")
+                self.type_relay_link_up = False
                 time.sleep(0.5)
                 continue
             topic = self.remote_config["topic"]
             secret = self.remote_config["secret"]
             url = f"{NTFY_BASE_URL}/{topic}/sse"
             try:
-                self.set_remote_status("Connecting...")
                 # (connect_timeout, read_timeout) - ntfy sends a keepalive
                 # roughly every 45s, so a long read timeout would otherwise
                 # look identical to a genuinely dead connection.
                 with requests.get(url, stream=True, timeout=(10, 90)) as resp:
                     resp.raise_for_status()
                     backoff = 1.0
-                    self.set_remote_status("Connected")
+                    self.type_relay_link_up = True
+                    self.type_last_relay_error = None
                     for line in resp.iter_lines(decode_unicode=True):
                         if not self.remote_watch_enabled:
                             break
@@ -701,6 +727,13 @@ class App:
                         # shared secret are ever acted on.
                         if payload.get("secret") != secret:
                             continue
+                        kind = payload.get("kind", "text")
+                        if kind == "heartbeat":
+                            if payload.get("role") == "send":
+                                self.type_last_peer_heartbeat = time.time()
+                            continue
+                        if kind != "text":
+                            continue
                         text = payload.get("text", "")
                         if not text:
                             continue
@@ -712,8 +745,8 @@ class App:
                         # just lets that happen instead of skipping.
                         self.handle_new_clipboard_text(text)
             except Exception as exc:
-                if self.remote_watch_enabled:
-                    self.set_remote_status(f"Disconnected ({exc}) - retrying...")
+                self.type_relay_link_up = False
+                self.type_last_relay_error = str(exc)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
@@ -734,33 +767,124 @@ class App:
         if self.send_clipboard_remote_enabled:
             self.send_remote_btn.config(text="Stop Sending Clipboard to Remote Laptop")
             self.last_sent_clipboard_text = self.safe_paste()
+            # Same reasoning as toggle_remote_watch - don't let a stale
+            # heartbeat from a previous session claim "Connected" early.
+            self.send_last_peer_heartbeat = 0.0
             self.status_label.config(text="Sending clipboard copies to the remote laptop...")
         else:
             self.send_remote_btn.config(text="Send Clipboard to Remote Laptop")
             self.status_label.config(text="Stopped sending clipboard to remote laptop.")
 
     def relay_health_loop(self):
-        """Keeps the "send" mode's Relay status label current. Sending is
-        just an occasional POST, not a persistent connection like the
-        receiving side's SSE stream, so there's nothing to react to as it
-        happens - instead this periodically checks that the relay is
-        actually reachable, purely so switching to "send" mode shows
-        something meaningful before you've copied anything yet."""
+        """Sends mode's counterpart to remote_watch_loop: opens the same
+        kind of SSE subscription, but only to detect the receiving
+        laptop's heartbeat (see heartbeat_sender_loop) - it doesn't act on
+        any text, that's not this laptop's job in "send" mode. This is
+        what lets "Relay:" reflect genuine two-way pairing instead of just
+        "can this laptop reach ntfy.sh at all", which used to say
+        Reachable even with no receiving laptop running."""
+        backoff = 1.0
         while True:
-            if self.remote_config is None:
-                self.set_relay_status("Not configured")
-                time.sleep(2)
+            if self.remote_config is None or self.mode_var.get() != "send" or not self.send_clipboard_remote_enabled:
+                self.send_relay_link_up = False
+                time.sleep(0.5)
                 continue
-            if self.mode_var.get() != "send":
-                self.set_relay_status("Off")
-                time.sleep(1)
+            topic = self.remote_config["topic"]
+            secret = self.remote_config["secret"]
+            url = f"{NTFY_BASE_URL}/{topic}/sse"
+            try:
+                with requests.get(url, stream=True, timeout=(10, 90)) as resp:
+                    resp.raise_for_status()
+                    backoff = 1.0
+                    self.send_relay_link_up = True
+                    self.send_last_relay_error = None
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if self.mode_var.get() != "send" or not self.send_clipboard_remote_enabled:
+                            break
+                        if not line or not line.startswith("data:"):
+                            continue
+                        try:
+                            event = json.loads(line[len("data:"):].strip())
+                        except ValueError:
+                            continue
+                        if event.get("event") != "message":
+                            continue
+                        try:
+                            payload = json.loads(event.get("message", ""))
+                        except ValueError:
+                            continue
+                        if payload.get("secret") != secret:
+                            continue
+                        if payload.get("kind") == "heartbeat" and payload.get("role") == "type":
+                            self.send_last_peer_heartbeat = time.time()
+            except Exception as exc:
+                self.send_relay_link_up = False
+                self.send_last_relay_error = str(exc)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+
+    def heartbeat_sender_loop(self):
+        """Announces this laptop's presence (role="type" or "send",
+        whichever is active) over the relay every HEARTBEAT_INTERVAL_SECONDS,
+        so the OTHER laptop's remote_watch_loop/relay_health_loop can tell
+        it's genuinely there - see the module-level comment above
+        HEARTBEAT_INTERVAL_SECONDS for why this exists."""
+        while True:
+            time.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            if self.remote_config is None:
+                continue
+            mode = self.mode_var.get()
+            if mode == "type" and self.remote_watch_enabled:
+                role = "type"
+            elif mode == "send" and self.send_clipboard_remote_enabled:
+                role = "send"
+            else:
                 continue
             try:
-                requests.head(NTFY_BASE_URL, timeout=5)
-                self.set_relay_status("Reachable")
+                topic = self.remote_config["topic"]
+                secret = self.remote_config["secret"]
+                requests.post(
+                    f"{NTFY_BASE_URL}/{topic}",
+                    data=json.dumps({"secret": secret, "kind": "heartbeat", "role": role}),
+                    headers={"Content-Type": "text/plain"},
+                    timeout=8,
+                )
             except Exception:
-                self.set_relay_status("Unreachable - check your internet connection")
-            time.sleep(8)
+                pass  # best-effort - a missed heartbeat just delays "Connected" showing again, nothing breaks
+
+    def connection_status_ticker(self):
+        """Single place that decides what the "Remote trigger:"/"Relay:"
+        labels actually say, based on this laptop's own relay link plus
+        whether a heartbeat from the OTHER role has been seen recently -
+        recomputed on a timer (not just on events) since "the peer went
+        quiet" is a time-based condition, not something either SSE loop
+        would otherwise notice on its own."""
+        while True:
+            time.sleep(1)
+            if self.remote_config is None:
+                self.set_remote_status("Not configured")
+                self.set_relay_status("Not configured")
+                continue
+
+            if not self.remote_watch_enabled:
+                self.set_remote_status("Off")
+            elif not self.type_relay_link_up:
+                detail = f" ({self.type_last_relay_error})" if self.type_last_relay_error else ""
+                self.set_remote_status(f"Connecting{detail}...")
+            elif (time.time() - self.type_last_peer_heartbeat) < HEARTBEAT_TIMEOUT_SECONDS:
+                self.set_remote_status("Connected")
+            else:
+                self.set_remote_status("Waiting for sending laptop...")
+
+            if not self.send_clipboard_remote_enabled:
+                self.set_relay_status("Off")
+            elif not self.send_relay_link_up:
+                detail = f" ({self.send_last_relay_error})" if self.send_last_relay_error else ""
+                self.set_relay_status(f"Connecting{detail}...")
+            elif (time.time() - self.send_last_peer_heartbeat) < HEARTBEAT_TIMEOUT_SECONDS:
+                self.set_relay_status("Connected")
+            else:
+                self.set_relay_status("Waiting for receiving laptop...")
 
     def clipboard_to_remote_loop(self):
         while True:
@@ -775,7 +899,7 @@ class App:
                 secret = self.remote_config["secret"]
                 resp = requests.post(
                     f"{NTFY_BASE_URL}/{topic}",
-                    data=json.dumps({"secret": secret, "text": current}),
+                    data=json.dumps({"secret": secret, "kind": "text", "text": current}),
                     headers={"Content-Type": "text/plain"},
                     timeout=10,
                 )

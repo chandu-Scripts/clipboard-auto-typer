@@ -160,14 +160,14 @@ def get_notepad_text_pattern(hwnd, timeout=5.0):
 
 def scroll_notepad_to_end(text_pattern):
     """Scrolls Notepad's view so the very end of the document is visible.
-    Called after every UI Automation write (see AutoTyper._run's flush())
-    because SetValue() replaces the control's content directly rather than
-    moving a caret through it the way real typing would - without this,
-    once the text grows past one screen, newly-written text lands below
-    the visible area and stays there until the user manually scrolls
-    down. `text_pattern` may be None (e.g. a Notepad variant that doesn't
-    expose one); this is then a no-op rather than an error, since typing
-    itself doesn't depend on it."""
+    Called from App.scroll_follow_loop, on a thread independent of
+    AutoTyper's own, because SetValue() replaces the control's content
+    directly rather than moving a caret through it the way real typing
+    would - without this, once the text grows past one screen,
+    newly-written text lands below the visible area and stays there until
+    the user manually scrolls down. `text_pattern` may be None (e.g. a
+    Notepad variant that doesn't expose one); this is then a no-op rather
+    than an error, since typing itself doesn't depend on it."""
     if text_pattern is None:
         return
     try:
@@ -179,6 +179,54 @@ def scroll_notepad_to_end(text_pattern):
         end_range.ScrollIntoView(alignTop=False)
     except Exception:
         pass  # best-effort - never let a scroll failure interrupt typing
+
+
+def is_notepad_scrolled_to_end(text_pattern):
+    """True if Notepad's current view already shows the very end of the
+    document - used by App.scroll_follow_loop to tell "the user manually
+    scrolled up to re-read something" apart from "new text just landed
+    and the view hasn't caught up yet", so auto-scroll can stop following
+    without needing to touch the view at all (a read-only check, unlike
+    scroll_notepad_to_end's ScrollIntoView). Defaults to True (safe to
+    keep following) when this can't be determined, so a lookup failure
+    never leaves auto-scroll permanently stuck off."""
+    if text_pattern is None:
+        return True
+    try:
+        visible_ranges = text_pattern.GetVisibleRanges()
+        if not visible_ranges:
+            return True
+        doc_range = text_pattern.DocumentRange
+        last_visible = visible_ranges[-1]
+        return last_visible.CompareEndpoints(auto.TextPatternRangeEndpoint.End, doc_range, auto.TextPatternRangeEndpoint.End) >= 0
+    except Exception:
+        return True
+
+
+def next_sticky_scroll_state(sticky_following, content_grew, at_end_check):
+    """Pure decision logic for App.scroll_follow_loop's "sticky" auto-scroll
+    (chat-app style: stop auto-scrolling once the user manually scrolls
+    away from the bottom, resume once they scroll back) - kept separate
+    from that method so it can be unit-tested without a real Notepad
+    window or any UI Automation calls at all.
+
+    The core problem this solves: "user scrolled away" and "new text just
+    landed and the view hasn't caught up yet" both look identical as "the
+    view no longer shows the document's end" - `content_grew` is what
+    tells them apart (see scroll_follow_loop for why it's a reliable
+    signal). `at_end_check` is a zero-arg callable rather than a plain
+    bool so the real UI Automation lookup it wraps is only performed when
+    actually needed, matching the short-circuit evaluation this was
+    extracted from.
+
+    Returns (new_sticky_following, should_scroll)."""
+    if sticky_following:
+        if content_grew or at_end_check():
+            return True, True
+        return False, False
+    if not content_grew and at_end_check():
+        return True, True
+    return sticky_following, False
 
 
 class AutoTyper:
@@ -200,6 +248,7 @@ class AutoTyper:
         self.running_event.set()
         self.stop_flag = threading.Event()
         self.thread = None
+        self.last_flushed_length = 0
 
     def start(self, tokens, wpm, on_status, on_progress, on_done, target_hwnd, prefix=""):
         self.stop_flag.clear()
@@ -248,10 +297,6 @@ class AutoTyper:
         if value_pattern is None:
             on_status("Could not find Notepad's text area.")
             return
-        # Best-effort - if this particular Notepad variant doesn't expose a
-        # TextPattern for some reason, typing still works, it just won't
-        # auto-scroll to follow long output.
-        text_pattern = get_notepad_text_pattern(target_hwnd)
 
         # `prefix` carries whatever was already in Notepad (plus
         # ENTRY_SEPARATOR) - entries are no longer cleared between jobs, so
@@ -261,29 +306,27 @@ class AutoTyper:
         written_parts = [prefix] if prefix else []
         done_words = 0
         words_since_flush = 0
+        # Read by App.scroll_follow_loop (on a different thread) to tell
+        # whether new content has landed since it last checked, without
+        # any UI Automation call of its own - see that method for why
+        # scrolling doesn't happen here at all: scroll_notepad_to_end()
+        # costs about as much as SetValue() itself (measured ~1s vs
+        # ~0.5s), so calling it from every flush made high-WPM jobs
+        # bottleneck on UI Automation overhead instead of actually running
+        # at the requested speed (300 WPM measured at ~100 WPM effective).
+        self.last_flushed_length = 0
 
-        def flush(force_scroll=False):
+        def flush():
             if not win32gui.IsWindow(target_hwnd):
                 on_status("Notepad window closed - stopped.")
                 return False
+            full_text = "".join(written_parts)
             try:
-                value_pattern.SetValue("".join(written_parts))
+                value_pattern.SetValue(full_text)
             except Exception as exc:
                 on_status(f"Could not write to Notepad: {exc}")
                 return False
-            # scroll_notepad_to_end() costs about as much as SetValue()
-            # itself (measured ~1s vs ~0.5s) - calling it from every flush
-            # made high-WPM jobs bottleneck on UI Automation call overhead
-            # instead of actually running at the requested speed (300 WPM
-            # measured at ~100 WPM effective with that approach). Ongoing
-            # scrolling during a job is instead handled off this thread
-            # entirely by App.scroll_follow_loop, which doesn't share this
-            # loop's pacing budget; force_scroll is only True for the very
-            # last flush, so the job still ends with the view definitely
-            # caught up rather than possibly stale until that loop's next
-            # tick.
-            if force_scroll:
-                scroll_notepad_to_end(text_pattern)
+            self.last_flushed_length = len(full_text)
             on_progress(done_words, total_words)
             return True
 
@@ -315,10 +358,7 @@ class AutoTyper:
                 # typing threads briefly run at once and corrupt Notepad.
                 self.stop_flag.wait(max(0, target_duration - (time.time() - call_start)))
 
-        # Final flush for any remaining tail (last partial batch, trailing
-        # whitespace) - always scrolls regardless of throttling, so the job
-        # never finishes leaving the view stuck at a stale scroll position.
-        if not flush(force_scroll=True):
+        if not flush():  # final flush for any remaining tail (last partial batch, trailing whitespace)
             return
         on_status("Done")
         on_done()
@@ -504,6 +544,7 @@ class App:
         self.clipboard_watch_enabled = False
         self.last_clipboard_text = ""
         self.notepad_hwnd = None
+        self.notepad_sticky_following = True  # see scroll_follow_loop
 
         self.remote_config = load_remote_config()
         self.remote_watch_enabled = False
@@ -1010,13 +1051,19 @@ class App:
         independently of AutoTyper's own thread - see the comment in
         AutoTyper._run's flush() for why scrolling can't just happen
         inline there without capping effective typing speed well below
-        whatever WPM is configured. Runs continuously regardless of
-        whether a job is active; the text_pattern lookup is cached per
-        window handle so an idle tick (no job running) costs nothing
-        beyond the sleep."""
+        whatever WPM is configured. The actual follow/stop decision is
+        made by next_sticky_scroll_state (a pure function, easy to test
+        without a real Notepad window) - this method just feeds it live
+        state every tick and acts on the result.
+
+        self.notepad_sticky_following persists across jobs (not reset
+        when one starts/ends), since a manual scroll is about the user's
+        reading position in the file, not tied to any one job - it's
+        reset only when the target window itself changes."""
         auto.InitializeUIAutomationInCurrentThread()
         cached_hwnd = None
         cached_text_pattern = None
+        last_seen_length = -1
         while True:
             time.sleep(1.0)
             if not self.typer.is_running() or self.notepad_hwnd is None:
@@ -1024,7 +1071,18 @@ class App:
             if self.notepad_hwnd != cached_hwnd:
                 cached_text_pattern = get_notepad_text_pattern(self.notepad_hwnd, timeout=1.0)
                 cached_hwnd = self.notepad_hwnd
-            scroll_notepad_to_end(cached_text_pattern)
+                self.notepad_sticky_following = True
+                last_seen_length = -1
+
+            current_length = self.typer.last_flushed_length
+            content_grew = current_length != last_seen_length
+            last_seen_length = current_length
+
+            self.notepad_sticky_following, should_scroll = next_sticky_scroll_state(
+                self.notepad_sticky_following, content_grew, lambda: is_notepad_scrolled_to_end(cached_text_pattern)
+            )
+            if should_scroll:
+                scroll_notepad_to_end(cached_text_pattern)
 
     # ---- shared status/control helpers ----
 

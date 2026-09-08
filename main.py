@@ -5,19 +5,23 @@ import re
 import socket
 import socketserver
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 from tkinter import filedialog
 
 import keyboard
 import pyperclip
+import pystray
 import requests
 import uiautomation as auto
 import win32api
 import win32con
 import win32gui
 import win32process
+from PIL import Image, ImageDraw
 
 CLIPBOARD_POLL_SECONDS = 0.15
 
@@ -65,6 +69,17 @@ UIA_CALL_INTERVAL_SECONDS = 0.5
 # file is gitignored; it's generated per-install, never committed.
 NTFY_BASE_URL = "https://ntfy.sh"
 REMOTE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "remote_config.json")
+# Local-only session state (last-used mode/connection/path/speed, and
+# whether the toggle was on) - kept separate from remote_config.json,
+# which is meant to be copied between the two laptops; "was this laptop
+# sending or receiving" is specific to this one, not something to share.
+APP_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_settings.json")
+# pythonw.exe has no console, so an unhandled exception anywhere - main
+# thread, a background thread, or inside a Tkinter callback - would
+# otherwise just vanish with zero indication anything went wrong. See
+# main()'s sys.excepthook/threading.excepthook wiring and
+# App.report_callback_exception.
+CRASH_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash.log")
 
 # "Connected"/"Reachable" used to mean only "this laptop can reach ntfy.sh
 # at all", which stayed true even with no laptop on the other end - not a
@@ -139,6 +154,58 @@ def get_local_ip():
         return "127.0.0.1"
     finally:
         s.close()
+
+
+def load_app_settings():
+    """Loads last-used UI/session state (mode, connection type, Notepad
+    path, speed, and whether each toggle was on) so a restart doesn't
+    require re-selecting everything - see App.apply_saved_settings.
+    Returns an empty dict (all defaults) if the file is missing or
+    malformed, same reasoning as load_remote_config."""
+    try:
+        with open(APP_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_app_settings(settings):
+    """Persists app_settings.json - see App.autosave_settings_loop. Purely
+    a convenience; failures are silent, same as save_remote_config."""
+    try:
+        with open(APP_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except OSError:
+        pass
+
+
+def log_exception(context, exc_type, exc_value, exc_tb):
+    """Appends a timestamped traceback to crash.log - the only way to see
+    an unhandled exception at all under pythonw.exe, which has no console
+    for stderr to go to. Best-effort: if writing the log itself fails,
+    give up rather than raise (this runs inside exception handlers - it
+    must never itself throw)."""
+    try:
+        with open(CRASH_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Unhandled exception in {context}:\n")
+            f.writelines(traceback.format_exception(exc_type, exc_value, exc_tb))
+    except Exception:
+        pass
+
+
+def log_still_alive():
+    """Appends a timestamped heartbeat line to crash.log, independent of
+    log_exception. This is what makes the log useful even for a crash
+    these hooks can't catch (a native-level crash inside the win32gui/
+    uiautomation COM interop, or the process being killed outright by
+    Windows/antivirus) - no exception, so nothing else would get logged,
+    but the last heartbeat timestamp still narrows down when it died."""
+    try:
+        with open(CRASH_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] still running\n")
+    except OSError:
+        pass
 
 
 def tokenize(text):
@@ -542,6 +609,18 @@ def force_foreground(hwnd):
             win32process.AttachThreadInput(current_thread, fg_thread, False)
 
 
+def create_tray_icon_image():
+    """Generates the system tray icon in memory - no bundled asset file
+    needed. Just a simple, distinctive colored square, not meant to be
+    anything elaborate."""
+    size = 64
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle([4, 4, size - 4, size - 4], radius=12, fill=(37, 99, 235, 255))
+    draw.rounded_rectangle([20, 20, size - 20, size - 20], radius=6, fill=(255, 255, 255, 255))
+    return image
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -647,6 +726,13 @@ class App:
             send_remote_frame, text="Send Clipboard to Remote Laptop", command=self.toggle_send_clipboard_remote
         )
         self.send_remote_btn.pack(side="left")
+        # Fires one heartbeat immediately instead of waiting up to
+        # HEARTBEAT_INTERVAL_SECONDS for the next automatic one, and
+        # reports the outcome of that specific network call directly -
+        # useful when actively troubleshooting rather than watching the
+        # passive Relay: status settle on its own timer.
+        self.test_connection_btn = tk.Button(send_remote_frame, text="Test Connection", command=self.test_connection)
+        self.test_connection_btn.pack(side="left", padx=(6, 0))
         self.relay_status_label = tk.Label(self.send_container, text="Relay: Off", fg="gray", anchor="w")
         self.relay_status_label.pack(fill="x", padx=10, pady=(0, 6))
 
@@ -702,7 +788,110 @@ class App:
         threading.Thread(target=self.heartbeat_sender_loop, daemon=True).start()
         threading.Thread(target=self.connection_status_ticker, daemon=True).start()
         threading.Thread(target=self.scroll_follow_loop, daemon=True).start()
+        threading.Thread(target=self.autosave_settings_loop, daemon=True).start()
         keyboard.add_hotkey(PAUSE_HOTKEY, self.on_pause_hotkey, suppress=True)
+
+        self.apply_saved_settings(load_app_settings())
+
+        # Closing the window (X) minimizes to tray instead of quitting -
+        # this app is meant to run continuously in the background, not be
+        # closed and reopened. Only the tray menu's "Exit" actually ends
+        # the process.
+        self.tray_icon = None
+        root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        threading.Thread(target=self.run_tray_icon, daemon=True).start()
+
+    # ---- system tray ----
+
+    def hide_to_tray(self):
+        self.root.withdraw()
+
+    def show_window(self, icon=None, item=None):
+        # pystray menu callbacks run on the tray icon's own thread, not
+        # Tkinter's - same reasoning as every other cross-thread UI update
+        # in this app (on_status, set_remote_status, ...).
+        self.root.after(0, self._do_show_window)
+
+    def _do_show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def exit_app(self, icon=None, item=None):
+        self.stop_remote_watch()  # closes the LAN server socket cleanly, if one was open
+        if self.tray_icon is not None:
+            self.tray_icon.stop()
+        self.root.after(0, self.root.destroy)
+
+    def run_tray_icon(self):
+        menu = pystray.Menu(
+            pystray.MenuItem("Show Window", self.show_window, default=True),
+            pystray.MenuItem("Exit", self.exit_app),
+        )
+        self.tray_icon = pystray.Icon("clipboard_auto_typer", create_tray_icon_image(), "Clipboard Auto Typer", menu)
+        self.tray_icon.run()  # blocks this thread until self.tray_icon.stop() is called
+
+    # ---- settings persistence ----
+
+    def apply_saved_settings(self, settings):
+        """Restores last-used mode/connection type/Notepad path/speed, and
+        re-enables whichever toggle was on when last saved, so a restart
+        doesn't require re-selecting everything - see
+        autosave_settings_loop for where these get saved. Called once at
+        startup with whatever load_app_settings() found (an empty dict,
+        and every setting left at its widget default, if this is the
+        first run or the file's missing/corrupt)."""
+        mode = settings.get("mode")
+        if mode in ("type", "send"):
+            self.mode_var.set(mode)
+        connection_type = settings.get("connection_type")
+        if connection_type in ("internet", "lan"):
+            self.connection_type_var.set(connection_type)
+        file_path = settings.get("file_path")
+        if file_path:
+            self.file_path_var.set(file_path)
+        wpm = settings.get("wpm")
+        if isinstance(wpm, int) and 20 <= wpm <= 300:
+            self.wpm_var.set(wpm)
+
+        # Same handlers a user clicking the radio buttons would trigger -
+        # syncs container visibility etc. Safe to call here since nothing
+        # is enabled yet, so their "stop whatever was running" step is a
+        # harmless no-op.
+        self.on_mode_change()
+        self.on_connection_type_change()
+
+        if self.remote_config is None:
+            return
+        if self.mode_var.get() == "type" and settings.get("remote_watch_enabled"):
+            self.toggle_remote_watch()
+        elif self.mode_var.get() == "send" and settings.get("send_clipboard_remote_enabled"):
+            self.toggle_send_clipboard_remote()
+
+    def autosave_settings_loop(self):
+        """Periodically snapshots current mode/connection/path/speed/toggle
+        state to app_settings.json (rather than wiring a trace on every
+        relevant widget variable), and piggybacks the crash-log "still
+        alive" heartbeat on the same timer - see log_still_alive for why
+        that matters even though this loop isn't itself doing anything
+        related to crash detection."""
+        last_heartbeat_log = 0.0
+        while True:
+            time.sleep(5)
+            save_app_settings(
+                {
+                    "mode": self.mode_var.get(),
+                    "connection_type": self.connection_type_var.get(),
+                    "file_path": self.file_path_var.get(),
+                    "wpm": self.wpm_var.get(),
+                    "remote_watch_enabled": self.remote_watch_enabled,
+                    "send_clipboard_remote_enabled": self.send_clipboard_remote_enabled,
+                }
+            )
+            now = time.time()
+            if now - last_heartbeat_log >= 60:
+                log_still_alive()
+                last_heartbeat_log = now
 
     # ---- mode switch ----
 
@@ -1063,6 +1252,44 @@ class App:
         self.send_last_peer_heartbeat = 0.0
         self.status_label.config(text="Sending clipboard copies to the remote laptop...")
 
+    def test_connection(self):
+        """Fires one heartbeat-shaped request immediately, instead of
+        waiting up to HEARTBEAT_INTERVAL_SECONDS for the next automatic
+        one, and reports the outcome of that specific call - lets you
+        check "is my own outbound path even working" on demand rather
+        than watching the passive Relay: status settle on its own timer.
+        Doesn't require Send Clipboard to Remote Laptop to be on."""
+        if self.remote_config is None:
+            self.status_label.config(text="Remote trigger not configured - see remote_config.json.")
+            return
+        if self.connection_type_var.get() == "lan" and not self.lan_receiver_ip_var.get().strip():
+            self.status_label.config(text="Enter the receiving laptop's LAN IP address first.")
+            return
+        self.status_label.config(text="Testing connection...")
+        threading.Thread(target=self._test_connection_worker, daemon=True).start()
+
+    def _test_connection_worker(self):
+        secret = self.remote_config["secret"]
+        payload = json.dumps({"secret": secret, "kind": "heartbeat", "role": self.mode_var.get()})
+        try:
+            if self.connection_type_var.get() == "lan":
+                ip = self.lan_receiver_ip_var.get().strip()
+                port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)
+                resp = requests.post(
+                    f"http://{ip}:{port}/", data=payload, headers={"Content-Type": "text/plain"}, timeout=5
+                )
+                resp.raise_for_status()
+                self.send_last_peer_heartbeat = time.time()  # a successful direct POST IS the confirmation
+            else:
+                topic = self.remote_config["topic"]
+                resp = requests.post(
+                    f"{NTFY_BASE_URL}/{topic}", data=payload, headers={"Content-Type": "text/plain"}, timeout=8
+                )
+                resp.raise_for_status()
+            self.on_status("Test message sent successfully.")
+        except Exception as exc:
+            self.on_status(f"Test failed: {exc}")
+
     def relay_health_loop(self):
         """Sends mode's counterpart to remote_watch_loop: opens the same
         kind of SSE subscription, but only to detect the receiving
@@ -1344,7 +1571,25 @@ class App:
 
 
 def main():
+    # Set only here, not at module import time - importing main.py from a
+    # test script shouldn't silently redirect that test's own exceptions
+    # into crash.log instead of showing up where the test can see them.
+    def log_main_thread_exception(exc_type, exc_value, exc_tb):
+        log_exception("main thread", exc_type, exc_value, exc_tb)
+
+    def log_background_thread_exception(args):
+        log_exception(f"thread '{args.thread.name}'", args.exc_type, args.exc_value, args.exc_traceback)
+
+    sys.excepthook = log_main_thread_exception
+    threading.excepthook = log_background_thread_exception
+
     root = tk.Tk()
+    # Tkinter already intercepts exceptions raised inside widget callbacks
+    # (button commands, etc.) - by default it just prints them to stderr,
+    # invisible under pythonw.exe. Route those into the same log too.
+    root.report_callback_exception = lambda exc_type, exc_value, exc_tb: log_exception(
+        "tkinter callback", exc_type, exc_value, exc_tb
+    )
     App(root)
     root.mainloop()
 

@@ -3,3 +3,5 @@ pyperclip
 pywin32
 uiautomation
 requests
+pystray
+Pillow

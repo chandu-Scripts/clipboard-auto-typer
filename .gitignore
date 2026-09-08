@@ -12,6 +12,10 @@ env/
 # Remote trigger secret (topic + shared secret) - never commit
 remote_config.json
 
+# Local session state - not shared between laptops, regenerated on use
+app_settings.json
+crash.log
+
 # OS
 Thumbs.db
 .DS_Store

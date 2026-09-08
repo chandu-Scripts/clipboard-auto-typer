@@ -16,6 +16,10 @@ Copy text anywhere — an AI response, a document, dictated text — and it appe
 - Auto-launches Notepad with your chosen file if it isn't already open.
 - **Laptop-to-laptop**: copy on one Windows laptop and it types into Notepad on a second one, over the internet or a shared local network, within a second or two, at the receiving laptop's speed slider — see [Laptop-to-Laptop](#laptop-to-laptop) below.
 - **Mode switch**: each install of the app is either **Types** (writes to a local Notepad file) or **Sends** (relays its clipboard to another laptop in Types mode) — only the controls relevant to that role are shown, and a status line shows whether the relay connection is actually alive.
+- **Remembers your setup**: mode, connection type, Notepad path, speed, and whether a toggle was on are all restored automatically on the next launch — no need to re-select everything every time you restart the app.
+- **Runs in the background**: closing the window minimizes it to the system tray instead of quitting; right-click the tray icon for **Show Window** or **Exit**.
+- **Test Connection** button (Sends mode): checks connectivity on demand instead of waiting for the automatic status to update.
+- **Crash logging**: since the app runs without a visible console, any unexpected error is written to `crash.log` in the project folder instead of silently vanishing.
 
 ## Requirements
 

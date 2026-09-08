@@ -352,6 +352,15 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
     App.toggle_remote_watch when the server is created)."""
 
     def do_POST(self):
+        # ThreadingTCPServer spawns a brand new OS thread for every
+        # incoming request (not a reused pool) and none of them have UI
+        # Automation initialized - same requirement as every other
+        # UIA-touching thread in this app (see AutoTyper._run,
+        # clipboard_watch_loop, etc.), just easy to miss here since it's
+        # the standard library spawning the thread, not code of ours that
+        # obviously needed this call added. Cheap to call even if this
+        # thread somehow gets reused for a second request.
+        auto.InitializeUIAutomationInCurrentThread()
         app = self.server.app_ref
         try:
             length = int(self.headers.get("Content-Length", 0))

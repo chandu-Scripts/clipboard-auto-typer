@@ -14,7 +14,7 @@ Copy text anywhere — an AI response, a document, dictated text — and it appe
 - **Reliable by construction**: text is written directly into Notepad's text control via Windows UI Automation rather than simulated keystrokes, so it can't drop or corrupt characters, and doesn't depend on which window happens to have focus at any given instant.
 - **Works with both** the modern Windows 11 (Store) Notepad and the classic `notepad.exe`.
 - Auto-launches Notepad with your chosen file if it isn't already open.
-- **Laptop-to-laptop**: copy on one Windows laptop and it types into Notepad on a second one, over the internet, within a second or two, at the receiving laptop's speed slider — see [Laptop-to-Laptop](#laptop-to-laptop) below.
+- **Laptop-to-laptop**: copy on one Windows laptop and it types into Notepad on a second one, over the internet or a shared local network, within a second or two, at the receiving laptop's speed slider — see [Laptop-to-Laptop](#laptop-to-laptop) below.
 - **Mode switch**: each install of the app is either **Types** (writes to a local Notepad file) or **Sends** (relays its clipboard to another laptop in Types mode) — only the controls relevant to that role are shown, and a status line shows whether the relay connection is actually alive.
 
 ## Requirements
@@ -57,7 +57,10 @@ The app polls the clipboard for changes on a background thread. When new text is
 
 ## Laptop-to-Laptop
 
-Copy-paste normally only works on the same machine. This app can also relay clipboard text between two Windows laptops over the internet, through [ntfy.sh](https://ntfy.sh) — a free, no-signup pub/sub service — so copying on one laptop types into Notepad on the other.
+Copy-paste normally only works on the same machine. This app can relay clipboard text between two Windows laptops two ways — pick whichever fits where the laptops actually are, via the **Connection** selector in the app:
+
+- **Internet Relay** — works from anywhere, routed through [ntfy.sh](https://ntfy.sh), a free, no-signup pub/sub service. Depends on that third party and its free-tier daily message quota.
+- **Local Network (LAN)** — only works when both laptops share a network (same WiFi/router), but then it's a direct connection with no internet hop and no quota at all.
 
 ### One-time setup
 
@@ -69,18 +72,30 @@ Copy-paste normally only works on the same machine. This app can also relay clip
    ```json
    {
      "topic": "your-random-topic",
-     "secret": "your-random-secret"
+     "secret": "your-random-secret",
+     "lan_port": 8765,
+     "lan_receiver_ip": ""
    }
    ```
-   This file is git-ignored and never uploaded anywhere — keep it private, since anyone with both the topic and secret could type into your Notepad.
+   This file is git-ignored and never uploaded anywhere — keep it private, since anyone with the secret could type into your Notepad. `topic` is only used by Internet Relay; `lan_port`/`lan_receiver_ip` only by LAN (the default port rarely needs changing, and `lan_receiver_ip` gets filled in automatically the first time you use LAN mode as the sender — see below).
 
-### Using it
+### Using it (Internet Relay)
 
-1. On the **receiving** laptop: select **This laptop: Types**, set the Notepad file path, click **Enable Web Remote Trigger**. The "Remote trigger:" line shows **Connected** once the relay link is live.
-2. On the **sending** laptop: select **This laptop: Sends**, click **Send Clipboard to Remote Laptop**. The "Relay:" line shows **Reachable** once it can reach the network.
-3. Copy anything on the sending laptop — it appears on the receiving laptop's Notepad within a second or two, at the receiving laptop's speed slider setting.
+1. On the **receiving** laptop: select **This laptop: Types** and **Connection: Internet Relay**, set the Notepad file path, click **Enable Web Remote Trigger**.
+2. On the **sending** laptop: select **This laptop: Sends** and **Connection: Internet Relay**, click **Send Clipboard to Remote Laptop**.
+3. Both sides' status lines show **Connected** within a few seconds once both are running — this means each side has actually confirmed it's hearing from the other, not just that it can reach the relay.
+4. Copy anything on the sending laptop — it appears on the receiving laptop's Notepad within a second or two, at the receiving laptop's speed slider setting.
 
-Switching a laptop's mode automatically turns off whatever the other mode's controls were doing (e.g. selecting **Sends** stops **Enable Web Remote Trigger** if it was on), since that laptop can only really play one role at a time with a given `remote_config.json`.
+### Using it (Local Network / LAN)
+
+1. On the **receiving** laptop: select **This laptop: Types** and **Connection: Local Network (LAN)**, set the Notepad file path, click **Enable Web Remote Trigger**. The status line shows the laptop's own LAN address, e.g. `Listening on 192.168.1.42:8765 - waiting for sending laptop...`.
+2. On the **sending** laptop: select **This laptop: Sends** and **Connection: Local Network (LAN)**, enter the receiving laptop's IP (shown in step 1) into **Receiver's LAN IP**, click **Send Clipboard to Remote Laptop**. That IP is remembered in `remote_config.json` for next time.
+3. Both sides show **Connected** once a message has actually gone through.
+4. Copy anything on the sending laptop — it appears on the receiving laptop's Notepad within a second or two, at the receiving laptop's speed slider setting.
+
+Switching a laptop's mode or connection type automatically turns off whatever was previously running (e.g. selecting **Sends** stops **Enable Web Remote Trigger** if it was on; switching from Internet Relay to LAN stops an active internet-relay connection), since a laptop can only really play one role, on one transport, at a time.
+
+**First-time LAN use**: the receiving laptop opens a small local server, so the first time you enable it, Windows Firewall may prompt to allow `python.exe` (or `pythonw.exe`) to accept incoming network connections — allow it, at least for private/home networks, or the sending laptop won't be able to reach it.
 
 ## License
 

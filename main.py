@@ -1,6 +1,9 @@
+import http.server
 import json
 import os
 import re
+import socket
+import socketserver
 import subprocess
 import threading
 import time
@@ -73,14 +76,24 @@ REMOTE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "r
 HEARTBEAT_INTERVAL_SECONDS = 5
 HEARTBEAT_TIMEOUT_SECONDS = 12
 
+# When both laptops are on the same network, they can talk directly
+# instead of relaying through ntfy.sh - no internet round-trip, no daily
+# message quota. Both sides must agree on this port (stored in
+# remote_config.json as "lan_port", defaulting here if absent).
+LAN_DEFAULT_PORT = 8765
+
 TOKEN_PATTERN = re.compile(r"\S+|\s+")
 
 
 def load_remote_config():
-    """Loads the ntfy topic + shared secret used by the web remote trigger.
-    Returns None if the file is missing or malformed, so the feature is
-    simply unavailable rather than crashing the app - it's optional, and the
-    file deliberately isn't committed to git (see remote_config.example.json)."""
+    """Loads the shared secret used by both the internet relay (ntfy.sh
+    topic) and the direct LAN connection, plus their optional settings
+    (lan_port, lan_receiver_ip). Returns None if the file is missing or
+    malformed, so remote features are simply unavailable rather than
+    crashing the app - the file deliberately isn't committed to git (see
+    remote_config.example.json). lan_receiver_ip is specific to whichever
+    laptop is doing the sending - it's harmless (just unused) if present
+    in a copy of this file on a laptop that's only receiving."""
     if not os.path.exists(REMOTE_CONFIG_PATH):
         return None
     try:
@@ -88,10 +101,44 @@ def load_remote_config():
             data = json.load(f)
         topic, secret = data.get("topic"), data.get("secret")
         if topic and secret:
-            return {"topic": topic, "secret": secret}
+            return {
+                "topic": topic,
+                "secret": secret,
+                "lan_port": data.get("lan_port", LAN_DEFAULT_PORT),
+                "lan_receiver_ip": data.get("lan_receiver_ip", ""),
+            }
     except (OSError, ValueError):
         pass
     return None
+
+
+def save_remote_config(config):
+    """Persists remote_config.json (e.g. after the user enters a LAN
+    receiver IP, so they don't need to retype it every restart). Silently
+    does nothing on failure - this is a convenience, not something the
+    app's correctness depends on."""
+    try:
+        with open(REMOTE_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+    except OSError:
+        pass
+
+
+def get_local_ip():
+    """Best-effort local LAN IP address for this machine (not 127.0.0.1),
+    shown to the user so they know what to type into the other laptop's
+    "Receiver IP" field. Opens a UDP "connection" to a public address
+    purely to ask the OS which local interface it would route through -
+    no packet actually needs to be sent for that, and no internet access
+    is required for this to work."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 def tokenize(text):
@@ -227,6 +274,45 @@ def next_sticky_scroll_state(sticky_following, content_grew, at_end_check):
     if not content_grew and at_end_check():
         return True, True
     return sticky_following, False
+
+
+class LANRequestHandler(http.server.BaseHTTPRequestHandler):
+    """Handles direct-LAN messages on the receiving laptop - the local
+    equivalent of remote_watch_loop's ntfy.sh subscription, except here
+    the sending laptop connects straight to this laptop's own small HTTP
+    server instead of both sides talking through a third party. Expects
+    `self.server.app_ref` to be set to the owning App instance (done in
+    App.toggle_remote_watch when the server is created)."""
+
+    def do_POST(self):
+        app = self.server.app_ref
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            payload = json.loads(body)
+        except (ValueError, TypeError):
+            self.send_response(400)
+            self.end_headers()
+            return
+        secret = (app.remote_config or {}).get("secret")
+        if not secret or payload.get("secret") != secret:
+            self.send_response(403)
+            self.end_headers()
+            return
+        # Any validly-secret-matched request (heartbeat or real text) is
+        # proof the sending laptop can reach this one - see
+        # connection_status_ticker for how this drives the "Connected"
+        # status on this side.
+        app.lan_last_request_time = time.time()
+        if payload.get("kind", "text") == "text":
+            text = payload.get("text", "")
+            if text:
+                app.handle_new_clipboard_text(text)
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # suppress BaseHTTPRequestHandler's default per-request stderr logging
 
 
 class AutoTyper:
@@ -479,6 +565,24 @@ class App:
             mode_frame, text="Sends (to another laptop)", variable=self.mode_var, value="send", command=self.on_mode_change
         ).pack(side="left", padx=(6, 0))
 
+        # Internet relay (ntfy.sh) works from anywhere but depends on a
+        # third party and its daily message quota; direct LAN connection
+        # only works when both laptops share a network, but then it's
+        # faster and has no quota at all. Applies regardless of which
+        # role (above) this laptop is playing.
+        connection_frame = tk.Frame(root)
+        connection_frame.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(connection_frame, text="Connection:").pack(side="left")
+        self.connection_type_var = tk.StringVar(value="internet")
+        tk.Radiobutton(
+            connection_frame, text="Internet Relay", variable=self.connection_type_var, value="internet",
+            command=self.on_connection_type_change,
+        ).pack(side="left", padx=(6, 0))
+        tk.Radiobutton(
+            connection_frame, text="Local Network (LAN)", variable=self.connection_type_var, value="lan",
+            command=self.on_connection_type_change,
+        ).pack(side="left", padx=(6, 0))
+
         # ---- "type" mode controls ----
         self.type_container = tk.Frame(root)
 
@@ -526,7 +630,18 @@ class App:
         # ---- "send" mode controls ----
         self.send_container = tk.Frame(root)
 
+        # Only relevant/shown for LAN connections - the internet relay
+        # doesn't need this since ntfy.sh's topic already identifies where
+        # to send. Packed before send_remote_frame so it appears above the
+        # button when shown; visibility is toggled by
+        # on_connection_type_change, not by mode alone.
+        self.lan_ip_frame = tk.Frame(self.send_container)
+        tk.Label(self.lan_ip_frame, text="Receiver's LAN IP:").pack(side="left")
+        self.lan_receiver_ip_var = tk.StringVar()
+        tk.Entry(self.lan_ip_frame, textvariable=self.lan_receiver_ip_var, width=16).pack(side="left", padx=(6, 0))
+
         send_remote_frame = tk.Frame(self.send_container)
+        self._send_remote_frame = send_remote_frame  # referenced by on_connection_type_change for pack ordering
         send_remote_frame.pack(fill="x", padx=10, pady=(0, 2))
         self.send_remote_btn = tk.Button(
             send_remote_frame, text="Send Clipboard to Remote Laptop", command=self.toggle_send_clipboard_remote
@@ -551,19 +666,32 @@ class App:
         if self.remote_config is None:
             self.remote_btn.config(state="disabled")
             self.send_remote_btn.config(state="disabled")
+        else:
+            self.lan_receiver_ip_var.set(self.remote_config.get("lan_receiver_ip", ""))
 
         self.send_clipboard_remote_enabled = False
         self.last_sent_clipboard_text = ""
 
         # Heartbeat/pairing state - separate per role so the idle role's
         # loop (always running, just gated off) can't clobber the active
-        # role's state by both writing the same shared variable.
+        # role's state by both writing the same shared variable. Also
+        # used for LAN mode's "Connected" status (see
+        # connection_status_ticker) even though LAN doesn't hold a
+        # persistent connection the way the ntfy.sh SSE subscription does.
         self.type_relay_link_up = False
         self.type_last_peer_heartbeat = 0.0
         self.type_last_relay_error = None
         self.send_relay_link_up = False
         self.send_last_peer_heartbeat = 0.0
         self.send_last_relay_error = None
+
+        # LAN-specific state. lan_server/lan_local_ip only exist while the
+        # LAN listener is actually running; lan_last_request_time is
+        # updated by LANRequestHandler whenever anything (heartbeat or
+        # text) arrives from a sending laptop.
+        self.lan_server = None
+        self.lan_local_ip = None
+        self.lan_last_request_time = 0.0
 
         self.last_hotkey_time = 0.0
 
@@ -581,9 +709,7 @@ class App:
     def on_mode_change(self):
         mode = self.mode_var.get()
         if mode == "type":
-            if self.send_clipboard_remote_enabled:
-                self.send_clipboard_remote_enabled = False
-                self.send_remote_btn.config(text="Send Clipboard to Remote Laptop")
+            self.stop_send_clipboard_remote()
             self.send_container.pack_forget()
             self.type_container.pack(fill="x")
             self.status_label.config(text="Idle")
@@ -597,12 +723,47 @@ class App:
                 self.watch_btn.config(text="Enable Clipboard Auto-Type")
                 self.file_path_entry.config(state="normal")
                 self.browse_btn.config(state="normal")
-            if self.remote_watch_enabled:
-                self.remote_watch_enabled = False
-                self.remote_btn.config(text="Enable Web Remote Trigger")
+            self.stop_remote_watch()
             self.type_container.pack_forget()
             self.send_container.pack(fill="x")
             self.status_label.config(text="Idle")
+
+    def on_connection_type_change(self):
+        # Switching transport mid-flight would leave stale state from the
+        # old one (an SSE thread still trying to reach ntfy.sh right after
+        # LAN was selected, or vice versa) - stop whichever role is
+        # currently active so re-enabling it starts fresh on the newly
+        # selected transport.
+        self.stop_remote_watch()
+        self.stop_send_clipboard_remote()
+        if self.connection_type_var.get() == "lan":
+            self.lan_ip_frame.pack(fill="x", padx=10, pady=(0, 6), before=self._send_remote_frame)
+        else:
+            self.lan_ip_frame.pack_forget()
+        self.status_label.config(text="Idle")
+
+    def stop_remote_watch(self):
+        """Turns off the "type" mode remote trigger, whichever transport
+        it's using, and cleans up the LAN server if one was running -
+        shared by on_mode_change, on_connection_type_change, and
+        toggle_remote_watch's own off-switch path."""
+        if not self.remote_watch_enabled:
+            return
+        self.remote_watch_enabled = False
+        self.remote_btn.config(text="Enable Web Remote Trigger")
+        if self.lan_server is not None:
+            self.lan_server.shutdown()
+            self.lan_server.server_close()
+            self.lan_server = None
+
+    def stop_send_clipboard_remote(self):
+        """Turns off "send" mode's clipboard relay - shared by
+        on_mode_change, on_connection_type_change, and
+        toggle_send_clipboard_remote's own off-switch path."""
+        if not self.send_clipboard_remote_enabled:
+            return
+        self.send_clipboard_remote_enabled = False
+        self.send_remote_btn.config(text="Send Clipboard to Remote Laptop")
 
     # ---- pause/stop controls ----
 
@@ -770,23 +931,36 @@ class App:
         if self.remote_config is None:
             self.status_label.config(text="Remote trigger not configured - see remote_config.json.")
             return
-        if not self.remote_watch_enabled:
-            file_path = self.file_path_var.get().strip()
-            if not file_path:
-                self.status_label.config(text="Select a Notepad file path first.")
-                return
-            self.remote_watch_enabled = True
-            # Reset so a stale heartbeat from before this was last enabled
-            # can't make the status say "Connected" before a fresh one has
-            # actually been seen.
-            self.type_last_peer_heartbeat = 0.0
-            self.remote_btn.config(text="Disable Web Remote Trigger")
-            self.status_label.config(text="Connecting to relay...")
-            threading.Thread(target=self.prelaunch_notepad, args=(file_path,), daemon=True).start()
-        else:
-            self.remote_watch_enabled = False
-            self.remote_btn.config(text="Enable Web Remote Trigger")
+        if self.remote_watch_enabled:
+            self.stop_remote_watch()
             self.status_label.config(text="Remote trigger stopped.")
+            return
+        file_path = self.file_path_var.get().strip()
+        if not file_path:
+            self.status_label.config(text="Select a Notepad file path first.")
+            return
+        if self.connection_type_var.get() == "lan":
+            port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)
+            try:
+                server = socketserver.ThreadingTCPServer(("0.0.0.0", port), LANRequestHandler)
+            except OSError as exc:
+                self.status_label.config(text=f"Could not start LAN listener on port {port}: {exc}")
+                return
+            server.app_ref = self
+            self.lan_server = server
+            self.lan_local_ip = get_local_ip()
+            self.lan_last_request_time = 0.0
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.status_label.config(text=f"LAN listener started on {self.lan_local_ip}:{port}.")
+        else:
+            self.status_label.config(text="Connecting to relay...")
+        self.remote_watch_enabled = True
+        # Reset so a stale heartbeat from before this was last enabled
+        # can't make the status say "Connected" before a fresh one has
+        # actually been seen.
+        self.type_last_peer_heartbeat = 0.0
+        self.remote_btn.config(text="Disable Web Remote Trigger")
+        threading.Thread(target=self.prelaunch_notepad, args=(file_path,), daemon=True).start()
 
     def remote_watch_loop(self):
         # Same reason as clipboard_watch_loop/AutoTyper._run - this thread
@@ -795,7 +969,10 @@ class App:
         auto.InitializeUIAutomationInCurrentThread()
         backoff = 1.0
         while True:
-            if not self.remote_watch_enabled or self.remote_config is None:
+            # LAN mode doesn't use this SSE-based loop at all - incoming
+            # messages there arrive via LANRequestHandler on the HTTP
+            # server thread instead (see toggle_remote_watch).
+            if not self.remote_watch_enabled or self.remote_config is None or self.connection_type_var.get() == "lan":
                 self.type_relay_link_up = False
                 time.sleep(0.5)
                 continue
@@ -867,17 +1044,24 @@ class App:
         if self.remote_config is None:
             self.status_label.config(text="Remote trigger not configured - see remote_config.json.")
             return
-        self.send_clipboard_remote_enabled = not self.send_clipboard_remote_enabled
         if self.send_clipboard_remote_enabled:
-            self.send_remote_btn.config(text="Stop Sending Clipboard to Remote Laptop")
-            self.last_sent_clipboard_text = self.safe_paste()
-            # Same reasoning as toggle_remote_watch - don't let a stale
-            # heartbeat from a previous session claim "Connected" early.
-            self.send_last_peer_heartbeat = 0.0
-            self.status_label.config(text="Sending clipboard copies to the remote laptop...")
-        else:
-            self.send_remote_btn.config(text="Send Clipboard to Remote Laptop")
+            self.stop_send_clipboard_remote()
             self.status_label.config(text="Stopped sending clipboard to remote laptop.")
+            return
+        if self.connection_type_var.get() == "lan":
+            ip = self.lan_receiver_ip_var.get().strip()
+            if not ip:
+                self.status_label.config(text="Enter the receiving laptop's LAN IP address first.")
+                return
+            self.remote_config["lan_receiver_ip"] = ip
+            save_remote_config(self.remote_config)
+        self.send_clipboard_remote_enabled = True
+        self.send_remote_btn.config(text="Stop Sending Clipboard to Remote Laptop")
+        self.last_sent_clipboard_text = self.safe_paste()
+        # Same reasoning as toggle_remote_watch - don't let a stale
+        # heartbeat from a previous session claim "Connected" early.
+        self.send_last_peer_heartbeat = 0.0
+        self.status_label.config(text="Sending clipboard copies to the remote laptop...")
 
     def relay_health_loop(self):
         """Sends mode's counterpart to remote_watch_loop: opens the same
@@ -889,7 +1073,16 @@ class App:
         Reachable even with no receiving laptop running."""
         backoff = 1.0
         while True:
-            if self.remote_config is None or self.mode_var.get() != "send" or not self.send_clipboard_remote_enabled:
+            # LAN mode doesn't need this at all - each direct POST already
+            # gets an HTTP response confirming delivery, so
+            # heartbeat_sender_loop can set send_last_peer_heartbeat
+            # itself on success without a separate subscription.
+            if (
+                self.remote_config is None
+                or self.mode_var.get() != "send"
+                or not self.send_clipboard_remote_enabled
+                or self.connection_type_var.get() == "lan"
+            ):
                 self.send_relay_link_up = False
                 time.sleep(0.5)
                 continue
@@ -929,30 +1122,48 @@ class App:
 
     def heartbeat_sender_loop(self):
         """Announces this laptop's presence (role="type" or "send",
-        whichever is active) over the relay every HEARTBEAT_INTERVAL_SECONDS,
-        so the OTHER laptop's remote_watch_loop/relay_health_loop can tell
-        it's genuinely there - see the module-level comment above
-        HEARTBEAT_INTERVAL_SECONDS for why this exists."""
+        whichever is active) every HEARTBEAT_INTERVAL_SECONDS, so the
+        other laptop can tell it's genuinely there - see the module-level
+        comment above HEARTBEAT_INTERVAL_SECONDS for why this exists.
+
+        Over the internet relay this is a one-way broadcast the other
+        side's own SSE subscription picks up. Over LAN there's no
+        subscription on either side - a direct POST's HTTP response IS
+        the confirmation, so a "type" role has nothing to send (the
+        receiving laptop doesn't initiate anything) and a "send" role
+        marks itself as seen immediately on a successful POST rather than
+        waiting to observe anything back."""
         while True:
             time.sleep(HEARTBEAT_INTERVAL_SECONDS)
             if self.remote_config is None:
                 continue
             mode = self.mode_var.get()
+            is_lan = self.connection_type_var.get() == "lan"
             if mode == "type" and self.remote_watch_enabled:
+                if is_lan:
+                    continue  # nothing to send - see docstring
                 role = "type"
             elif mode == "send" and self.send_clipboard_remote_enabled:
                 role = "send"
             else:
                 continue
+            secret = self.remote_config["secret"]
+            payload = json.dumps({"secret": secret, "kind": "heartbeat", "role": role})
             try:
-                topic = self.remote_config["topic"]
-                secret = self.remote_config["secret"]
-                requests.post(
-                    f"{NTFY_BASE_URL}/{topic}",
-                    data=json.dumps({"secret": secret, "kind": "heartbeat", "role": role}),
-                    headers={"Content-Type": "text/plain"},
-                    timeout=8,
-                )
+                if is_lan:
+                    ip = self.lan_receiver_ip_var.get().strip()
+                    if not ip:
+                        continue
+                    port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)
+                    requests.post(
+                        f"http://{ip}:{port}/", data=payload, headers={"Content-Type": "text/plain"}, timeout=5
+                    )
+                    self.send_last_peer_heartbeat = time.time()  # the successful POST above IS the confirmation
+                else:
+                    topic = self.remote_config["topic"]
+                    requests.post(
+                        f"{NTFY_BASE_URL}/{topic}", data=payload, headers={"Content-Type": "text/plain"}, timeout=8
+                    )
             except Exception:
                 pass  # best-effort - a missed heartbeat just delays "Connected" showing again, nothing breaks
 
@@ -969,9 +1180,16 @@ class App:
                 self.set_remote_status("Not configured")
                 self.set_relay_status("Not configured")
                 continue
+            is_lan = self.connection_type_var.get() == "lan"
 
             if not self.remote_watch_enabled:
                 self.set_remote_status("Off")
+            elif is_lan:
+                port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)
+                if (time.time() - self.lan_last_request_time) < HEARTBEAT_TIMEOUT_SECONDS:
+                    self.set_remote_status("Connected")
+                else:
+                    self.set_remote_status(f"Listening on {self.lan_local_ip}:{port} - waiting for sending laptop...")
             elif not self.type_relay_link_up:
                 detail = f" ({self.type_last_relay_error})" if self.type_last_relay_error else ""
                 self.set_remote_status(f"Connecting{detail}...")
@@ -982,6 +1200,11 @@ class App:
 
             if not self.send_clipboard_remote_enabled:
                 self.set_relay_status("Off")
+            elif is_lan:
+                if (time.time() - self.send_last_peer_heartbeat) < HEARTBEAT_TIMEOUT_SECONDS:
+                    self.set_relay_status("Connected")
+                else:
+                    self.set_relay_status("Trying to reach the receiving laptop...")
             elif not self.send_relay_link_up:
                 detail = f" ({self.send_last_relay_error})" if self.send_last_relay_error else ""
                 self.set_relay_status(f"Connecting{detail}...")
@@ -999,14 +1222,22 @@ class App:
                 current = self.safe_paste()
                 if not current or current == self.last_sent_clipboard_text:
                     continue
-                topic = self.remote_config["topic"]
                 secret = self.remote_config["secret"]
-                resp = requests.post(
-                    f"{NTFY_BASE_URL}/{topic}",
-                    data=json.dumps({"secret": secret, "kind": "text", "text": current}),
-                    headers={"Content-Type": "text/plain"},
-                    timeout=10,
-                )
+                payload = json.dumps({"secret": secret, "kind": "text", "text": current})
+                if self.connection_type_var.get() == "lan":
+                    ip = self.lan_receiver_ip_var.get().strip()
+                    if not ip:
+                        self.on_status("Enter the receiving laptop's LAN IP address first.")
+                        continue
+                    port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)
+                    resp = requests.post(
+                        f"http://{ip}:{port}/", data=payload, headers={"Content-Type": "text/plain"}, timeout=5
+                    )
+                else:
+                    topic = self.remote_config["topic"]
+                    resp = requests.post(
+                        f"{NTFY_BASE_URL}/{topic}", data=payload, headers={"Content-Type": "text/plain"}, timeout=10
+                    )
                 resp.raise_for_status()
                 # Only mark as sent on success - same reasoning as
                 # clipboard_watch_loop: a transient network failure should

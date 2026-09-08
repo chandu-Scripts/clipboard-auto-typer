@@ -1,4 +1,6 @@
 {
   "topic": "replace-with-a-long-random-topic-name",
-  "secret": "replace-with-a-long-random-secret"
+  "secret": "replace-with-a-long-random-secret",
+  "lan_port": 8765,
+  "lan_receiver_ip": ""
 }

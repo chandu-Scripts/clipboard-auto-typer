@@ -52,9 +52,10 @@ HOTKEY_DEBOUNCE_SECONDS = 0.5
 # the requested WPM without calling more often than that can support.
 UIA_CALL_INTERVAL_SECONDS = 0.5
 
-# Text sent from the web portal is relayed through ntfy.sh (a free, public
-# pub/sub service - see https://ntfy.sh): the portal POSTs to a topic, this
-# app subscribes to that same topic over Server-Sent Events. The topic name
+# Text copied on a paired sending laptop (see clipboard_to_remote_loop) is
+# relayed through ntfy.sh (a free, public pub/sub service - see
+# https://ntfy.sh): the sender POSTs to a topic, this app subscribes to
+# that same topic over Server-Sent Events. The topic name
 # alone is not a real secret (anyone who guesses/finds it could subscribe),
 # so every message also carries a shared secret that must match
 # remote_config.json - see remote_config.example.json for the format. That
@@ -413,18 +414,6 @@ class App:
         # ---- "send" mode controls ----
         self.send_container = tk.Frame(root)
 
-        # Only meaningful for a phone/browser receiver (portal.html) - a
-        # laptop receiver always types at its own WPM slider regardless of
-        # this value, since Notepad typing speed is controlled there, not
-        # here (see handle_new_clipboard_text).
-        phone_speed_frame = tk.Frame(self.send_container)
-        phone_speed_frame.pack(fill="x", padx=10, pady=(0, 6))
-        tk.Label(phone_speed_frame, text="Phone typing speed (WPM):").pack(side="left")
-        self.phone_wpm_var = tk.IntVar(value=80)
-        tk.Scale(
-            phone_speed_frame, from_=20, to=300, orient="horizontal", variable=self.phone_wpm_var, length=200
-        ).pack(side="left", padx=(4, 20))
-
         send_remote_frame = tk.Frame(self.send_container)
         send_remote_frame.pack(fill="x", padx=10, pady=(0, 2))
         self.send_remote_btn = tk.Button(
@@ -662,7 +651,7 @@ class App:
                 return
             self.remote_watch_enabled = True
             self.remote_btn.config(text="Disable Web Remote Trigger")
-            self.status_label.config(text="Connecting to web portal relay...")
+            self.status_label.config(text="Connecting to relay...")
             threading.Thread(target=self.prelaunch_notepad, args=(file_path,), daemon=True).start()
         else:
             self.remote_watch_enabled = False
@@ -730,12 +719,12 @@ class App:
 
     # ---- send-clipboard-to-remote-laptop flow ----
     # This is the mirror image of remote_watch_loop: instead of THIS laptop
-    # receiving text posted from the web portal, THIS laptop watches its own
-    # clipboard and auto-relays new copies to the same ntfy topic, so
-    # another laptop running this same app with "Enable Web Remote Trigger"
-    # on picks it up and types it - no manual paste-into-portal.html step
-    # needed. Both laptops must share the same remote_config.json (topic +
-    # secret); copy that file over once when setting this up.
+    # receiving relayed text, THIS laptop watches its own clipboard and
+    # auto-relays new copies to the same ntfy topic, so another laptop
+    # running this same app with "Enable Web Remote Trigger" on picks it up
+    # and types it automatically. Both laptops must share the same
+    # remote_config.json (topic + secret); copy that file over once when
+    # setting this up.
 
     def toggle_send_clipboard_remote(self):
         if self.remote_config is None:
@@ -784,12 +773,9 @@ class App:
                     continue
                 topic = self.remote_config["topic"]
                 secret = self.remote_config["secret"]
-                # "wpm" only matters to a phone/browser receiver (see
-                # portal.html) - a laptop receiver ignores it and uses its
-                # own WPM slider instead.
                 resp = requests.post(
                     f"{NTFY_BASE_URL}/{topic}",
-                    data=json.dumps({"secret": secret, "text": current, "wpm": self.phone_wpm_var.get()}),
+                    data=json.dumps({"secret": secret, "text": current}),
                     headers={"Content-Type": "text/plain"},
                     timeout=10,
                 )

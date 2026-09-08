@@ -14,7 +14,7 @@ Copy text anywhere — an AI response, a document, dictated text — and it appe
 - **Reliable by construction**: text is written directly into Notepad's text control via Windows UI Automation rather than simulated keystrokes, so it can't drop or corrupt characters, and doesn't depend on which window happens to have focus at any given instant.
 - **Works with both** the modern Windows 11 (Store) Notepad and the classic `notepad.exe`.
 - Auto-launches Notepad with your chosen file if it isn't already open.
-- **Web remote trigger**: paste text into a small web page from any device (another laptop, your phone) and it types into Notepad on this machine within a second or two, at your same speed slider — see [Web Remote Trigger](#web-remote-trigger) below.
+- **Laptop-to-laptop**: copy on one Windows laptop and it types into Notepad on a second one, over the internet, within a second or two, at the receiving laptop's speed slider — see [Laptop-to-Laptop](#laptop-to-laptop) below.
 - **Mode switch**: each install of the app is either **Types** (writes to a local Notepad file) or **Sends** (relays its clipboard to another laptop in Types mode) — only the controls relevant to that role are shown, and a status line shows whether the relay connection is actually alive.
 
 ## Requirements
@@ -55,9 +55,9 @@ While it's typing, switch to another app freely — generation pauses immediatel
 
 The app polls the clipboard for changes on a background thread. When new text is detected, it locates (or launches) the target Notepad window and writes the text into it word by word via [UI Automation](https://learn.microsoft.com/en-us/windows/win32/winauto/entry-uiautomation-win32), rather than simulating keystrokes — this is what makes typing reliable and focus-independent, while pause/resume is layered on top as a deliberate choice so the tool never interferes with input in whatever app you're actually using.
 
-## Web Remote Trigger
+## Laptop-to-Laptop
 
-Copy-paste normally only works on the same machine. To trigger typing from another device entirely (a second laptop, your phone), the app can also listen for text sent from a small web page, relayed through [ntfy.sh](https://ntfy.sh) — a free, no-signup pub/sub service. Remote-triggered text types at the same speed as your WPM slider.
+Copy-paste normally only works on the same machine. This app can also relay clipboard text between two Windows laptops over the internet, through [ntfy.sh](https://ntfy.sh) — a free, no-signup pub/sub service — so copying on one laptop types into Notepad on the other.
 
 ### One-time setup
 
@@ -65,7 +65,7 @@ Copy-paste normally only works on the same machine. To trigger typing from anoth
    ```bash
    python -c "import secrets; print('topic:', secrets.token_urlsafe(9)); print('secret:', secrets.token_urlsafe(18))"
    ```
-2. Create `remote_config.json` in the project folder (copy `remote_config.example.json` and fill in your own values):
+2. Create `remote_config.json` in the project folder on **both** laptops (copy `remote_config.example.json` and fill in the same values on each):
    ```json
    {
      "topic": "your-random-topic",
@@ -73,22 +73,12 @@ Copy-paste normally only works on the same machine. To trigger typing from anoth
    }
    ```
    This file is git-ignored and never uploaded anywhere — keep it private, since anyone with both the topic and secret could type into your Notepad.
-3. Open `portal.html` in a browser (any device — copy the file over, email it to yourself, or host it somewhere). On first load it will ask for the same **Topic** and **Secret key** you put in `remote_config.json`; these are saved only in that browser's local storage.
 
 ### Using it
 
-1. In the app, make sure **This laptop: Types** is selected, set your Notepad file path, and click **Enable Web Remote Trigger**. The "Remote trigger:" line below it shows **Connected** once the relay link is live.
-2. On any device, open `portal.html`, paste your paragraph, and click **Send to Notepad**.
-3. Within a second or two, it appears in Notepad on this laptop, at your speed slider's pace — no clipboard, cable, or shared network required, just an internet connection on both ends.
-
-### Laptop-to-laptop, hands-free
-
-If the "other device" is a second Windows laptop running this same app, you don't need `portal.html` at all — copying on one laptop can automatically type into Notepad on the other:
-
-1. Copy `remote_config.json` (same file, same topic/secret) onto the second laptop's copy of this project.
-2. On the **receiving** laptop: select **This laptop: Types**, set the Notepad file path, click **Enable Web Remote Trigger**.
-3. On the **sending** laptop: select **This laptop: Sends**, click **Send Clipboard to Remote Laptop**. The "Relay:" line shows **Reachable** once it can reach the network.
-4. Copy anything on the sending laptop — it appears on the receiving laptop's Notepad within a second or two, at the receiving laptop's speed slider setting.
+1. On the **receiving** laptop: select **This laptop: Types**, set the Notepad file path, click **Enable Web Remote Trigger**. The "Remote trigger:" line shows **Connected** once the relay link is live.
+2. On the **sending** laptop: select **This laptop: Sends**, click **Send Clipboard to Remote Laptop**. The "Relay:" line shows **Reachable** once it can reach the network.
+3. Copy anything on the sending laptop — it appears on the receiving laptop's Notepad within a second or two, at the receiving laptop's speed slider setting.
 
 Switching a laptop's mode automatically turns off whatever the other mode's controls were doing (e.g. selecting **Sends** stops **Enable Web Remote Trigger** if it was on), since that laptop can only really play one role at a time with a given `remote_config.json`.
 

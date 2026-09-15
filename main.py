@@ -299,6 +299,19 @@ def scroll_word_to_end(doc):
         pass  # best-effort - never let a scroll failure interrupt typing
 
 
+class LANServer(socketserver.ThreadingTCPServer):
+    """Plain ThreadingTCPServer, except request-handling errors (a client
+    disconnecting mid-response, a malformed request, etc. - see the
+    ConnectionResetError this app hit in practice when a slow Word COM
+    call outlasted the sending laptop's old, shorter request timeout) go
+    to crash.log via log_exception instead of BaseServer's default
+    handle_error(), which just prints to stderr - invisible under
+    pythonw.exe, which has no console for stderr to go to."""
+
+    def handle_error(self, request, client_address):
+        log_exception(f"LAN request from {client_address}", *sys.exc_info())
+
+
 class LANRequestHandler(http.server.BaseHTTPRequestHandler):
     """Handles direct-LAN messages on the receiving laptop - the local
     equivalent of remote_watch_loop's ntfy.sh subscription, except here
@@ -365,8 +378,16 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
                 threading.Thread(target=self._start_typing, args=(app, text), daemon=True).start()
         elif kind in ("pause", "resume"):
             should_pause = kind == "pause"
-            app.root.after(0, lambda sp=should_pause: app.remote_set_paused(sp))
-            reported_paused = should_pause
+            # remote_set_paused() mirrors this same guard (no job running,
+            # or already in the requested state) and no-ops in either
+            # case - checked here too so the response doesn't optimistically
+            # report a state change that's not actually going to happen.
+            # is_running() reads Thread.is_alive(), which is safe to call
+            # from this (non-main) thread.
+            if app.typer.is_running() and should_pause != app.paused:
+                app.root.after(0, lambda sp=should_pause: app.remote_set_paused(sp))
+                reported_paused = should_pause
+            # else: nothing will change - reported_paused stays app.paused
         response_body = json.dumps({"paused": reported_paused}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -1219,7 +1240,7 @@ class App:
         if self.connection_type_var.get() == "lan":
             port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)
             try:
-                server = socketserver.ThreadingTCPServer(("0.0.0.0", port), LANRequestHandler)
+                server = LANServer(("0.0.0.0", port), LANRequestHandler)
             except OSError as exc:
                 self.status_label.config(text=f"Could not start LAN listener on port {port}: {exc}")
                 return

@@ -344,9 +344,25 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
         if payload.get("kind", "text") == "text":
             text = payload.get("text", "")
             if text:
-                app.handle_new_clipboard_text(text)
+                # Handing off to a background thread and responding
+                # immediately, rather than awaiting handle_new_clipboard_text
+                # here, decouples the sender's request timeout from however
+                # long Word's COM calls take (cold Word start, a
+                # OneDrive-synced document path, etc. can all push this past
+                # a few seconds) - otherwise the sender can give up and
+                # close the connection while this thread is still working,
+                # which surfaces as a ConnectionResetError on end_headers()
+                # below even though the text was already on its way to Word.
+                threading.Thread(target=self._start_typing, args=(app, text), daemon=True).start()
         self.send_response(200)
         self.end_headers()
+
+    def _start_typing(self, app, text):
+        pythoncom.CoInitialize()
+        try:
+            app.handle_new_clipboard_text(text)
+        finally:
+            pythoncom.CoUninitialize()
 
     def log_message(self, format, *args):
         pass  # suppress BaseHTTPRequestHandler's default per-request stderr logging
@@ -1430,8 +1446,18 @@ class App:
                         self.on_status("Enter the receiving laptop's LAN IP address first.")
                         continue
                     port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)
+                    # Unlike a heartbeat, the receiver does real work here
+                    # before responding - handle_new_clipboard_text()
+                    # connects to (or launches) Word via COM, which can
+                    # take several seconds (cold Word start, a
+                    # OneDrive-synced document path, etc.). A short timeout
+                    # here caused the sender to give up and close the
+                    # connection while the receiver was still mid-connect,
+                    # which surfaced as a ConnectionResetError on the
+                    # receiver's end_headers() call even though typing had
+                    # already been kicked off - confusing on both sides.
                     resp = requests.post(
-                        f"http://{ip}:{port}/", data=payload, headers={"Content-Type": "text/plain"}, timeout=5
+                        f"http://{ip}:{port}/", data=payload, headers={"Content-Type": "text/plain"}, timeout=20
                     )
                 else:
                     topic = self.remote_config["topic"]

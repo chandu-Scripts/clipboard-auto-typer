@@ -341,7 +341,16 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
         # connection_status_ticker for how this drives the "Connected"
         # status on this side.
         app.lan_last_request_time = time.time()
-        if payload.get("kind", "text") == "text":
+        kind = payload.get("kind", "text")
+        # Reported in the response body below so the sending laptop's
+        # Ctrl+Alt+P hotkey knows this laptop's REAL current pause state,
+        # not just its own guess (see App.remote_typer_paused). For a
+        # pause/resume command, report the state we just applied rather
+        # than re-reading app.paused - remote_set_paused() below runs on
+        # the Tk main thread via root.after(), so it may not have actually
+        # run yet by the time this response goes out.
+        reported_paused = app.paused
+        if kind == "text":
             text = payload.get("text", "")
             if text:
                 # Handing off to a background thread and responding
@@ -354,8 +363,16 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
                 # which surfaces as a ConnectionResetError on end_headers()
                 # below even though the text was already on its way to Word.
                 threading.Thread(target=self._start_typing, args=(app, text), daemon=True).start()
+        elif kind in ("pause", "resume"):
+            should_pause = kind == "pause"
+            app.root.after(0, lambda sp=should_pause: app.remote_set_paused(sp))
+            reported_paused = should_pause
+        response_body = json.dumps({"paused": reported_paused}).encode("utf-8")
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_body)))
         self.end_headers()
+        self.wfile.write(response_body)
 
     def _start_typing(self, app, text):
         pythoncom.CoInitialize()
@@ -738,6 +755,14 @@ class App:
 
         self.send_clipboard_remote_enabled = False
         self.last_sent_clipboard_text = ""
+        # Send mode's best-known view of the receiving laptop's actual
+        # pause state - updated from the receiver's response on every LAN
+        # heartbeat/text POST, or from the receiver's own periodic
+        # heartbeat broadcast over Internet Relay (see remote_set_paused,
+        # heartbeat_sender_loop, relay_health_loop). Used so the Ctrl+Alt+P
+        # hotkey on THIS laptop knows whether to send "pause" or "resume"
+        # next, even if the receiving laptop was also toggled locally.
+        self.remote_typer_paused = False
 
         # Heartbeat/pairing state - separate per role so the idle role's
         # loop (always running, just gated off) can't clobber the active
@@ -952,11 +977,73 @@ class App:
         self.root.after(0, self.handle_pause_hotkey)
 
     def handle_pause_hotkey(self):
-        if self.typer.is_running():
-            self.on_pause()
+        """In Types mode this pauses/resumes the local typing job, same as
+        the Pause button. In Sends mode there's no local job to pause - the
+        same hotkey instead sends a pause/resume command to the receiving
+        laptop over whatever connection is active, so one hotkey controls
+        typing from either laptop (see remote_typer_paused for how the
+        sender tracks the receiver's real state instead of just guessing)."""
+        mode = self.mode_var.get()
+        if mode == "type":
+            if self.typer.is_running():
+                self.on_pause()
+        elif mode == "send":
+            if self.remote_config is None:
+                self.status_label.config(text="Remote trigger not configured - see remote_config.json.")
+                return
+            if not self.send_clipboard_remote_enabled:
+                self.status_label.config(text="Enable 'Send Clipboard to Remote Laptop' first.")
+                return
+            if self.connection_type_var.get() == "lan" and not self.lan_receiver_ip_var.get().strip():
+                self.status_label.config(text="Enter the receiving laptop's LAN IP address first.")
+                return
+            # Optimistic - corrected by the next heartbeat/response if this
+            # guess turns out to be stale (e.g. the receiving laptop was
+            # also toggled locally since we last heard from it).
+            should_pause = not self.remote_typer_paused
+            self.remote_typer_paused = should_pause
+            threading.Thread(target=self.send_pause_resume_command, args=(should_pause,), daemon=True).start()
+
+    def send_pause_resume_command(self, should_pause):
+        secret = self.remote_config["secret"]
+        kind = "pause" if should_pause else "resume"
+        payload = json.dumps({"secret": secret, "kind": kind})
+        try:
+            if self.connection_type_var.get() == "lan":
+                ip = self.lan_receiver_ip_var.get().strip()
+                port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)
+                resp = requests.post(
+                    f"http://{ip}:{port}/", data=payload, headers={"Content-Type": "text/plain"}, timeout=10
+                )
+                self.update_remote_paused_from_response(resp)
+            else:
+                topic = self.remote_config["topic"]
+                requests.post(
+                    f"{NTFY_BASE_URL}/{topic}", data=payload, headers={"Content-Type": "text/plain"}, timeout=10
+                )
+                # No response body to confirm with over Internet Relay -
+                # the receiver's own periodic heartbeat broadcast will
+                # correct remote_typer_paused within HEARTBEAT_INTERVAL_SECONDS
+                # if this optimistic guess was wrong (see relay_health_loop).
+            self.on_status(f"Sent {kind} to remote laptop.")
+        except Exception as exc:
+            self.on_status(f"Could not send {kind} command: {exc}")
+
+    def update_remote_paused_from_response(self, resp):
+        """Reads the receiving laptop's actual current pause state back
+        from a LAN response body (see LANRequestHandler._handle_post),
+        keeping remote_typer_paused accurate instead of relying purely on
+        this laptop's own optimistic guess."""
+        try:
+            self.remote_typer_paused = bool(resp.json().get("paused", False))
+        except (ValueError, AttributeError):
+            pass
 
     def on_pause(self):
-        if not self.paused:
+        self.set_paused_state(not self.paused)
+
+    def set_paused_state(self, should_pause):
+        if should_pause:
             self.typer.pause()
             self.paused = True
             self.pause_btn.config(text="Resume")
@@ -965,6 +1052,18 @@ class App:
             self.typer.resume()
             self.paused = False
             self.pause_btn.config(text="Pause")
+
+    def remote_set_paused(self, should_pause):
+        """Applies a pause/resume command received from the sending
+        laptop (LAN: LANRequestHandler._handle_post; Internet Relay:
+        remote_watch_loop) - called via root.after() since both of those
+        run on background threads. Mirrors on_pause()'s own guard: no
+        point pausing/resuming a job that isn't running."""
+        if not self.typer.is_running():
+            return
+        if should_pause == self.paused:
+            return
+        self.set_paused_state(should_pause)
 
     def on_stop(self):
         self.typer.stop()
@@ -1191,6 +1290,10 @@ class App:
                             if payload.get("role") == "send":
                                 self.type_last_peer_heartbeat = time.time()
                             continue
+                        if kind in ("pause", "resume"):
+                            should_pause = kind == "pause"
+                            self.root.after(0, lambda sp=should_pause: self.remote_set_paused(sp))
+                            continue
                         if kind != "text":
                             continue
                         text = payload.get("text", "")
@@ -1330,6 +1433,8 @@ class App:
                             continue
                         if payload.get("kind") == "heartbeat" and payload.get("role") == "type":
                             self.send_last_peer_heartbeat = time.time()
+                            if "paused" in payload:
+                                self.remote_typer_paused = bool(payload.get("paused"))
             except Exception as exc:
                 self.send_relay_link_up = False
                 self.send_last_relay_error = str(exc)
@@ -1355,26 +1460,35 @@ class App:
                 continue
             mode = self.mode_var.get()
             is_lan = self.connection_type_var.get() == "lan"
+            payload_dict = {"secret": self.remote_config["secret"], "kind": "heartbeat"}
             if mode == "type" and self.remote_watch_enabled:
                 if is_lan:
                     continue  # nothing to send - see docstring
-                role = "type"
+                # Piggybacks this laptop's real pause state onto its own
+                # heartbeat broadcast - over Internet Relay this is the
+                # only channel the sending laptop has to learn it (there's
+                # no per-request response to read, unlike LAN), so
+                # send_pause_resume_command's optimistic guess on that side
+                # gets corrected here within one heartbeat interval if it
+                # was wrong (see relay_health_loop).
+                payload_dict["role"] = "type"
+                payload_dict["paused"] = self.paused
             elif mode == "send" and self.send_clipboard_remote_enabled:
-                role = "send"
+                payload_dict["role"] = "send"
             else:
                 continue
-            secret = self.remote_config["secret"]
-            payload = json.dumps({"secret": secret, "kind": "heartbeat", "role": role})
+            payload = json.dumps(payload_dict)
             try:
                 if is_lan:
                     ip = self.lan_receiver_ip_var.get().strip()
                     if not ip:
                         continue
                     port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)
-                    requests.post(
+                    resp = requests.post(
                         f"http://{ip}:{port}/", data=payload, headers={"Content-Type": "text/plain"}, timeout=5
                     )
                     self.send_last_peer_heartbeat = time.time()  # the successful POST above IS the confirmation
+                    self.update_remote_paused_from_response(resp)
                 else:
                     topic = self.remote_config["topic"]
                     requests.post(
@@ -1459,6 +1573,7 @@ class App:
                     resp = requests.post(
                         f"http://{ip}:{port}/", data=payload, headers={"Content-Type": "text/plain"}, timeout=20
                     )
+                    self.update_remote_paused_from_response(resp)
                 else:
                     topic = self.remote_config["topic"]
                     resp = requests.post(

@@ -4,7 +4,6 @@ import os
 import re
 import socket
 import socketserver
-import subprocess
 import sys
 import threading
 import time
@@ -15,9 +14,10 @@ from tkinter import filedialog
 import keyboard
 import pyperclip
 import pystray
+import pythoncom
 import requests
-import uiautomation as auto
 import win32api
+import win32com.client
 import win32con
 import win32gui
 import win32process
@@ -38,26 +38,44 @@ ENTRY_SEPARATOR = "\n" + "-" * 40 + "\n\n"
 PAUSE_HOTKEY = "ctrl+alt+insert"
 HOTKEY_DEBOUNCE_SECONDS = 0.5
 
-# Typing is done via UI Automation (see get_notepad_value_pattern), not
-# simulated keystrokes. Two independent problems with keyboard.write()/
-# send() led to this:
+# Typing is done via Word's COM automation (Document.Content.InsertAfter),
+# not simulated keystrokes. Two independent problems with keyboard.write()/
+# send() led to this direction generally:
 #   1. It only ever reaches whichever window has OS focus at the moment
 #      Windows actually delivers the event - not the moment this script
 #      checked focus - so switching apps mid-word could leak/corrupt text
 #      into the wrong window no matter how often focus was re-checked.
-#   2. Measured directly: even with Notepad focused the ENTIRE time (no
-#      app-switching involved at all), keyboard.write() intermittently drops
-#      a character and duplicates the next one (e.g. "my age is" came out
-#      as "yy gge is"). This is a known flakiness of the low-level
-#      SendInput-based injection keyboard.write() uses, not something a
-#      per-keystroke delay reliably fixes.
-# A single UI Automation SetValue() call, by contrast, measured a fixed
-# ~500ms cost regardless of text length and was correct in every test -
-# because it sets the control's content directly/atomically rather than
-# simulating individual key events. UIA_CALL_INTERVAL_SECONDS is that
-# measured cost; AutoTyper batches enough words per call to keep pace with
-# the requested WPM without calling more often than that can support.
-UIA_CALL_INTERVAL_SECONDS = 0.5
+#   2. Measured directly: even with the target window focused the ENTIRE
+#      time (no app-switching involved at all), keyboard.write()
+#      intermittently drops a character and duplicates the next one (e.g.
+#      "my age is" came out as "yy gge is"). This is a known flakiness of
+#      the low-level SendInput-based injection keyboard.write() uses, not
+#      something a per-keystroke delay reliably fixes.
+# This app originally used UI Automation against Notepad instead of Word
+# (SetValue() on the whole document each flush, ~500ms/call regardless of
+# length) - switched to Word because Notepad's font/zoom display reset
+# itself whenever a large automated write landed, with no reliable fix;
+# Word's font is a real, persistent document property instead of a
+# transient view-level setting, so it doesn't have that problem. As a
+# bonus, Word's Range.InsertAfter() is both much cheaper (~30ms measured,
+# even after 40 consecutive calls with no growth in cost) and a true
+# incremental append, unlike SetValue() needing the whole document
+# content re-sent on every call.
+WORD_DEFAULT_FONT_NAME = "Consolas"
+WORD_DEFAULT_FONT_SIZE = 14
+# Word constant for Range.Collapse() - collapses a range to a zero-length
+# point at its end. (wdCollapseEnd, hardcoded rather than pulled from
+# win32com.client.constants, since that requires generating Word's type
+# library wrapper via makepy first - not worth it for one constant.)
+WD_COLLAPSE_END = 0
+# Measured cost of one InsertAfter()+ScrollIntoView() call (~30ms, stable
+# across 40 consecutive calls with no cumulative slowdown as the document
+# grows) - AutoTyper batches enough words per call to keep pace with the
+# requested WPM without calling more often than this supports. In
+# practice this comes out to 1 word per call for any reasonable WPM,
+# since Word's COM calls are so much cheaper than the ~500ms Notepad's UI
+# Automation SetValue() cost this replaced.
+WORD_CALL_INTERVAL_SECONDS = 0.05
 
 # Text copied on a paired sending laptop (see clipboard_to_remote_loop) is
 # relayed through ntfy.sh (a free, public pub/sub service - see
@@ -157,11 +175,11 @@ def get_local_ip():
 
 
 def load_app_settings():
-    """Loads last-used UI/session state (mode, connection type, Notepad
-    path, speed, and whether each toggle was on) so a restart doesn't
-    require re-selecting everything - see App.apply_saved_settings.
-    Returns an empty dict (all defaults) if the file is missing or
-    malformed, same reasoning as load_remote_config."""
+    """Loads last-used UI/session state (mode, connection type, Word
+    document path, speed, font, and whether each toggle was on) so a
+    restart doesn't require re-selecting everything - see
+    App.apply_saved_settings. Returns an empty dict (all defaults) if the
+    file is missing or malformed, same reasoning as load_remote_config."""
     try:
         with open(APP_SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -198,7 +216,7 @@ def log_still_alive():
     """Appends a timestamped heartbeat line to crash.log, independent of
     log_exception. This is what makes the log useful even for a crash
     these hooks can't catch (a native-level crash inside the win32gui/
-    uiautomation COM interop, or the process being killed outright by
+    Word COM interop, or the process being killed outright by
     Windows/antivirus) - no exception, so nothing else would get logged,
     but the last heartbeat timestamp still narrows down when it died."""
     try:
@@ -215,132 +233,70 @@ def tokenize(text):
     return [(not m.group()[0].isspace(), m.group()) for m in TOKEN_PATTERN.finditer(text)]
 
 
-def find_notepad_text_control(hwnd, timeout=5.0):
-    """Finds the UI Automation control for a Notepad window's text editor,
-    given its win32 window handle. Returns None if the window or its text
-    control can no longer be found (e.g. Notepad was closed).
+def get_word_document(file_path, timeout=10.0):
+    """Connects to a running Word instance (launching one if none exists)
+    and returns the Document object for file_path - opening it if the
+    file exists, creating and saving it otherwise. Returns None if this
+    can't be done within `timeout` (e.g. Word is still starting up).
 
-    Tries both the modern (Windows 11 Store) Notepad's DocumentControl and
-    classic notepad.exe's EditControl, so this works against either. A
-    freshly-launched Notepad's own UI Automation tree can take a moment to
-    finish populating (separate from the win32 window itself already
-    existing/being visible) - especially the first time in a session, since
-    the modern Notepad is a WinUI3 app. `timeout` retries for that long
-    instead of giving up after one quick check, which was causing "Could
-    not find Notepad's text area" on a fresh launch even though Notepad had
-    genuinely just opened."""
+    Must be called on a thread that has already called
+    pythoncom.CoInitialize() - COM objects have thread affinity (the STA
+    apartment model), so a Document reference from one thread can't
+    safely be handed to another. Every caller in this app instead calls
+    get_word_document() fresh on its own thread; win32com.client.Dispatch
+    transparently connects to the SAME already-running Word process and
+    Documents collection rather than launching a duplicate (confirmed
+    directly: dispatching from a second thread sees the first thread's
+    document, same window handle, no new Word window opens)."""
     deadline = time.time() + timeout
+    target = os.path.normcase(os.path.abspath(file_path))
     while True:
-        if not win32gui.IsWindow(hwnd):
-            return None
         try:
-            window_ctrl = auto.ControlFromHandle(hwnd)
-            remaining = max(deadline - time.time(), 0.3)
-            wait = min(remaining, 1.0)
-            for finder in (window_ctrl.DocumentControl, window_ctrl.EditControl):
-                text_ctrl = finder(searchDepth=10)
-                if text_ctrl.Exists(wait):
-                    return text_ctrl
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = True
+            for d in word.Documents:
+                try:
+                    if os.path.normcase(d.FullName) == target:
+                        return d
+                except Exception:
+                    continue
+            if os.path.exists(file_path):
+                return word.Documents.Open(file_path)
+            doc = word.Documents.Add()
+            doc.SaveAs2(file_path)
+            return doc
         except Exception:
-            pass
-        if time.time() >= deadline:
-            return None
-        time.sleep(0.2)
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.3)
 
 
-def get_notepad_value_pattern(hwnd, timeout=5.0):
-    """Finds the UI Automation ValuePattern for a Notepad window's text
-    editor. This lets text be written directly into the control regardless
-    of which window currently has OS focus - unlike keyboard.write()/
-    send(), which always go to whatever window is in the foreground."""
-    text_ctrl = find_notepad_text_control(hwnd, timeout)
-    return text_ctrl.GetValuePattern() if text_ctrl is not None else None
-
-
-def get_notepad_text_pattern(hwnd, timeout=5.0):
-    """Finds the UI Automation TextPattern for a Notepad window's text
-    editor - used to scroll the view to follow newly-written text (see
-    scroll_notepad_to_end), since SetValue() replaces the control's
-    content directly rather than moving a caret through it, so Notepad has
-    no reason to auto-scroll on its own the way it would for real typing."""
-    text_ctrl = find_notepad_text_control(hwnd, timeout)
-    if text_ctrl is None:
-        return None
+def apply_word_font(doc, font_name, font_size):
+    """Sets the document's actual font - a real, persistent document
+    property, unlike Notepad's zoom/display font size, which turned out
+    to reset itself whenever a large automated write landed, with no
+    reliable fix (see the module comment above WORD_DEFAULT_FONT_NAME).
+    Best-effort: typing still works even if this fails for some reason."""
     try:
-        return text_ctrl.GetTextPattern()
+        doc.Content.Font.Name = font_name
+        doc.Content.Font.Size = font_size
     except Exception:
-        return None
+        pass
 
 
-def scroll_notepad_to_end(text_pattern):
-    """Scrolls Notepad's view so the very end of the document is visible.
-    Called from App.scroll_follow_loop, on a thread independent of
-    AutoTyper's own, because SetValue() replaces the control's content
-    directly rather than moving a caret through it the way real typing
-    would - without this, once the text grows past one screen,
-    newly-written text lands below the visible area and stays there until
-    the user manually scrolls down. `text_pattern` may be None (e.g. a
-    Notepad variant that doesn't expose one); this is then a no-op rather
-    than an error, since typing itself doesn't depend on it."""
-    if text_pattern is None:
-        return
+def scroll_word_to_end(doc):
+    """Scrolls the document's window so the very end is visible - called
+    after every write (see AutoTyper._run) so newly-typed text stays in
+    view as the document grows past one screen. Cheap enough (~30ms
+    measured, no growth over 40 consecutive calls) to do inline after
+    every flush, unlike the equivalent Notepad operation this app used to
+    do on a separate thread to avoid capping typing speed."""
     try:
-        doc_range = text_pattern.DocumentRange
-        end_range = doc_range.Clone()
-        end_range.MoveEndpointByRange(
-            auto.TextPatternRangeEndpoint.Start, doc_range, auto.TextPatternRangeEndpoint.End
-        )
-        end_range.ScrollIntoView(alignTop=False)
+        end_range = doc.Content
+        end_range.Collapse(WD_COLLAPSE_END)
+        doc.ActiveWindow.ScrollIntoView(end_range, True)
     except Exception:
         pass  # best-effort - never let a scroll failure interrupt typing
-
-
-def is_notepad_scrolled_to_end(text_pattern):
-    """True if Notepad's current view already shows the very end of the
-    document - used by App.scroll_follow_loop to tell "the user manually
-    scrolled up to re-read something" apart from "new text just landed
-    and the view hasn't caught up yet", so auto-scroll can stop following
-    without needing to touch the view at all (a read-only check, unlike
-    scroll_notepad_to_end's ScrollIntoView). Defaults to True (safe to
-    keep following) when this can't be determined, so a lookup failure
-    never leaves auto-scroll permanently stuck off."""
-    if text_pattern is None:
-        return True
-    try:
-        visible_ranges = text_pattern.GetVisibleRanges()
-        if not visible_ranges:
-            return True
-        doc_range = text_pattern.DocumentRange
-        last_visible = visible_ranges[-1]
-        return last_visible.CompareEndpoints(auto.TextPatternRangeEndpoint.End, doc_range, auto.TextPatternRangeEndpoint.End) >= 0
-    except Exception:
-        return True
-
-
-def next_sticky_scroll_state(sticky_following, content_grew, at_end_check):
-    """Pure decision logic for App.scroll_follow_loop's "sticky" auto-scroll
-    (chat-app style: stop auto-scrolling once the user manually scrolls
-    away from the bottom, resume once they scroll back) - kept separate
-    from that method so it can be unit-tested without a real Notepad
-    window or any UI Automation calls at all.
-
-    The core problem this solves: "user scrolled away" and "new text just
-    landed and the view hasn't caught up yet" both look identical as "the
-    view no longer shows the document's end" - `content_grew` is what
-    tells them apart (see scroll_follow_loop for why it's a reliable
-    signal). `at_end_check` is a zero-arg callable rather than a plain
-    bool so the real UI Automation lookup it wraps is only performed when
-    actually needed, matching the short-circuit evaluation this was
-    extracted from.
-
-    Returns (new_sticky_following, should_scroll)."""
-    if sticky_following:
-        if content_grew or at_end_check():
-            return True, True
-        return False, False
-    if not content_grew and at_end_check():
-        return True, True
-    return sticky_following, False
 
 
 class LANRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -353,14 +309,19 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         # ThreadingTCPServer spawns a brand new OS thread for every
-        # incoming request (not a reused pool) and none of them have UI
-        # Automation initialized - same requirement as every other
-        # UIA-touching thread in this app (see AutoTyper._run,
-        # clipboard_watch_loop, etc.), just easy to miss here since it's
-        # the standard library spawning the thread, not code of ours that
-        # obviously needed this call added. Cheap to call even if this
-        # thread somehow gets reused for a second request.
-        auto.InitializeUIAutomationInCurrentThread()
+        # incoming request (not a reused pool) and none of them have COM
+        # initialized - same requirement as every other Word-COM-touching
+        # thread in this app (see AutoTyper._run, clipboard_watch_loop,
+        # etc.), just easy to miss here since it's the standard library
+        # spawning the thread, not code of ours that obviously needed
+        # this call added.
+        pythoncom.CoInitialize()
+        try:
+            self._handle_post()
+        finally:
+            pythoncom.CoUninitialize()
+
+    def _handle_post(self):
         app = self.server.app_ref
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -392,32 +353,34 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
 
 
 class AutoTyper:
-    """Writes tokenized text into a specific target window via UI
-    Automation, in word batches paced to approximate a controllable WPM
-    speed. Runs on its own thread; pause/resume/stop are signaled via
-    threading events so the caller stays responsive. Pauses automatically
-    whenever the target window doesn't have OS focus (see
-    _wait_until_ready) and resumes exactly where it left off once it does -
-    this is a deliberate UX choice, not a technical requirement: because
-    writes happen as atomic UI Automation batch calls rather than
-    individual keystrokes, this pause is corruption-free by construction,
-    unlike the old keystroke-based approach. Pausing while unfocused means
-    the user can freely type in another app without any background writes
-    landing there or competing for input."""
+    """Writes tokenized text into a Word document via COM automation
+    (Document.Content.InsertAfter), in word batches paced to approximate
+    a controllable WPM speed. Runs on its own thread; pause/resume/stop
+    are signaled via threading events so the caller stays responsive.
+    Pauses automatically whenever the target window doesn't have OS focus
+    (see _wait_until_ready) and resumes exactly where it left off once it
+    does - this is a deliberate UX choice, not a technical requirement:
+    because writes happen as atomic COM calls rather than individual
+    keystrokes, this pause is corruption-free by construction, unlike the
+    old keystroke-based approach. Pausing while unfocused means the user
+    can freely type in another app without any background writes landing
+    there or competing for input. (Confirmed directly: InsertAfter works
+    correctly even while Word has no OS focus at all - the pause is a
+    deliberate feature carried over from this app's Notepad days, not
+    something Word automation actually requires.)"""
 
     def __init__(self):
         self.running_event = threading.Event()  # set = not paused
         self.running_event.set()
         self.stop_flag = threading.Event()
         self.thread = None
-        self.last_flushed_length = 0
 
-    def start(self, tokens, wpm, on_status, on_progress, on_done, target_hwnd, prefix=""):
+    def start(self, tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator):
         self.stop_flag.clear()
         self.running_event.set()
         self.thread = threading.Thread(
             target=self._run,
-            args=(tokens, wpm, on_status, on_progress, on_done, target_hwnd, prefix),
+            args=(tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator),
             daemon=True,
         )
         self.thread.start()
@@ -440,55 +403,63 @@ class AutoTyper:
     def is_running(self):
         return bool(self.thread and self.thread.is_alive())
 
-    def _run(self, tokens, wpm, on_status, on_progress, on_done, target_hwnd, prefix=""):
-        # UI Automation must be explicitly initialized on every thread that
-        # uses it, per the uiautomation library's own docs - without this,
-        # UIA/Control/Pattern calls made from a spawned thread (this one)
-        # rather than the main thread fail silently instead of raising a
-        # catchable exception, which looked like the whole job just hanging
-        # or doing nothing at all.
-        auto.InitializeUIAutomationInCurrentThread()
+    def _run(self, tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator):
+        # COM objects have thread affinity (the STA apartment model) -
+        # every thread that touches Word must initialize COM itself, the
+        # same per-thread requirement UI Automation had for Notepad.
+        pythoncom.CoInitialize()
+        try:
+            self._run_inner(tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator)
+        finally:
+            pythoncom.CoUninitialize()
+
+    def _run_inner(self, tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator):
         seconds_per_word = 60.0 / wpm
-        # Enough words per UIA call to roughly keep pace with the requested
-        # WPM without calling more often than UIA_CALL_INTERVAL_SECONDS
-        # supports (each call costs about that much regardless of length).
-        words_per_batch = max(1, round(UIA_CALL_INTERVAL_SECONDS / seconds_per_word))
+        # Enough words per call to roughly keep pace with the requested
+        # WPM without calling more often than WORD_CALL_INTERVAL_SECONDS
+        # supports - in practice this comes out to 1 word per call for
+        # any reasonable WPM, since Word's COM calls are cheap.
+        words_per_batch = max(1, round(WORD_CALL_INTERVAL_SECONDS / seconds_per_word))
         total_words = sum(1 for is_word, _ in tokens if is_word)
 
-        value_pattern = get_notepad_value_pattern(target_hwnd)
-        if value_pattern is None:
-            on_status("Could not find Notepad's text area.")
+        doc = get_word_document(file_path)
+        if doc is None:
+            on_status("Could not open the Word document.")
+            return
+        apply_word_font(doc, font_name, font_size)
+        try:
+            target_hwnd = doc.ActiveWindow.Hwnd
+        except Exception:
+            on_status("Could not find the Word window.")
             return
 
-        # `prefix` carries whatever was already in Notepad (plus
-        # ENTRY_SEPARATOR) - entries are no longer cleared between jobs, so
-        # each flush rewrites prior content verbatim alongside the new
-        # text. done_words/total_words below count only the new tokens,
-        # not anything already in prefix.
-        written_parts = [prefix] if prefix else []
+        if needs_separator:
+            try:
+                doc.Content.InsertAfter(ENTRY_SEPARATOR)
+            except Exception as exc:
+                on_status(f"Could not write to Word: {exc}")
+                return
+
+        # Unlike the old Notepad version, which had to re-send the WHOLE
+        # document on every flush (SetValue() replaces content rather
+        # than appending), Word's InsertAfter() genuinely appends - so
+        # pending_chunks only ever holds what's new since the last flush,
+        # cleared after each one.
+        pending_chunks = []
         done_words = 0
         words_since_flush = 0
-        # Read by App.scroll_follow_loop (on a different thread) to tell
-        # whether new content has landed since it last checked, without
-        # any UI Automation call of its own - see that method for why
-        # scrolling doesn't happen here at all: scroll_notepad_to_end()
-        # costs about as much as SetValue() itself (measured ~1s vs
-        # ~0.5s), so calling it from every flush made high-WPM jobs
-        # bottleneck on UI Automation overhead instead of actually running
-        # at the requested speed (300 WPM measured at ~100 WPM effective).
-        self.last_flushed_length = 0
 
         def flush():
             if not win32gui.IsWindow(target_hwnd):
-                on_status("Notepad window closed - stopped.")
+                on_status("Word window closed - stopped.")
                 return False
-            full_text = "".join(written_parts)
             try:
-                value_pattern.SetValue(full_text)
+                doc.Content.InsertAfter("".join(pending_chunks))
+                scroll_word_to_end(doc)
             except Exception as exc:
-                on_status(f"Could not write to Notepad: {exc}")
+                on_status(f"Could not write to Word: {exc}")
                 return False
-            self.last_flushed_length = len(full_text)
+            pending_chunks.clear()
             on_progress(done_words, total_words)
             return True
 
@@ -496,7 +467,7 @@ class AutoTyper:
             if not self._wait_until_ready(target_hwnd, on_status):
                 return  # stopped, or window closed - status already set
 
-            written_parts.append(chunk)
+            pending_chunks.append(chunk)
             if is_word:
                 done_words += 1
                 words_since_flush += 1
@@ -510,33 +481,35 @@ class AutoTyper:
                 # stop_flag.wait() instead of time.sleep(): at slow WPM this
                 # pacing delay can be several seconds, long enough that a
                 # plain sleep would make stop() take just as long to take
-                # effect - which matters now that a new remote-triggered
-                # job stops whatever's currently typing (see
-                # remote_watch_loop) rather than waiting for it to finish.
-                # wait() returns the instant stop() sets the flag, so the
-                # next loop iteration's _wait_until_ready check (which
-                # reports "Stopped") fires almost immediately instead of up
-                # to one whole batch-interval late - the gap that let two
-                # typing threads briefly run at once and corrupt Notepad.
+                # effect - which matters since a new remote-triggered job
+                # stops whatever's currently typing (see remote_watch_loop)
+                # rather than waiting for it to finish. wait() returns the
+                # instant stop() sets the flag, so the next loop
+                # iteration's _wait_until_ready check (which reports
+                # "Stopped") fires almost immediately instead of up to one
+                # whole batch-interval late.
                 self.stop_flag.wait(max(0, target_duration - (time.time() - call_start)))
 
-        if not flush():  # final flush for any remaining tail (last partial batch, trailing whitespace)
-            return
+        if pending_chunks:
+            if not flush():  # final flush for any remaining tail (last partial batch, trailing whitespace)
+                return
+        else:
+            scroll_word_to_end(doc)  # nothing left to flush, but make sure the view is fully caught up
         on_status("Done")
         on_done()
 
     def _wait_until_ready(self, target_hwnd, on_status):
-        """Blocks until not manually paused AND Notepad has OS focus, so
+        """Blocks until not manually paused AND Word has OS focus, so
         switching away pauses generation immediately (nothing more gets
         written) and switching back resumes it exactly where it left off -
         this is what lets the user freely type in another app (WhatsApp,
         Teams, ...) without the background writes interfering there.
         Checked once per token (word or whitespace run), not per-character -
-        since writing now happens as atomic UI Automation batch calls
-        rather than individual keystrokes, there's no risk of a corrupted
-        partial word from pausing here, so this doesn't need to be any
-        finer-grained than that. Returns False (with on_status already set)
-        if stop() was called or the target window has been closed."""
+        since writing now happens as atomic COM calls rather than
+        individual keystrokes, there's no risk of a corrupted partial word
+        from pausing here, so this doesn't need to be any finer-grained
+        than that. Returns False (with on_status already set) if stop()
+        was called or the target window has been closed."""
         announced = False
         while True:
             self.running_event.wait()
@@ -544,7 +517,7 @@ class AutoTyper:
                 on_status("Stopped")
                 return False
             if not win32gui.IsWindow(target_hwnd):
-                on_status("Notepad window closed - stopped.")
+                on_status("Word window closed - stopped.")
                 return False
             try:
                 has_focus = win32gui.GetForegroundWindow() == target_hwnd
@@ -553,34 +526,9 @@ class AutoTyper:
             if has_focus:
                 return True
             if not announced:
-                on_status("Paused - switch back to Notepad to resume typing.")
+                on_status("Paused - switch back to Word to resume typing.")
                 announced = True
             time.sleep(0.15)
-
-
-def find_window_by_title_substring(substring, timeout=5.0):
-    """Finds a visible top-level window whose title contains the given text.
-    Matching by PID doesn't work reliably here: on Windows 11, notepad.exe is
-    often the Store-packaged app, launched through an execution alias, so the
-    process this script starts isn't necessarily the one that owns the
-    window. Title matching sidesteps that entirely."""
-    deadline = time.time() + timeout
-    substring_lower = substring.lower()
-    while time.time() < deadline:
-        matches = []
-
-        def callback(hwnd, _):
-            if win32gui.IsWindowVisible(hwnd):
-                title = win32gui.GetWindowText(hwnd)
-                if title and substring_lower in title.lower():
-                    matches.append(hwnd)
-            return True
-
-        win32gui.EnumWindows(callback, None)
-        if matches:
-            return matches[0]
-        time.sleep(0.15)
-    return None
 
 
 def force_foreground(hwnd):
@@ -637,7 +585,7 @@ class App:
         root.geometry("560x300")
 
         # This laptop plays one of two roles at a time - "type" (types
-        # copied/relayed text into a local Notepad file) or "send" (relays
+        # copied/relayed text into a local Word document) or "send" (relays
         # its own clipboard to another laptop that's in "type" mode). Only
         # one role's controls are relevant at once, so the mode switch below
         # shows/hides them instead of leaving every control visible
@@ -647,7 +595,7 @@ class App:
         tk.Label(mode_frame, text="This laptop:").pack(side="left")
         self.mode_var = tk.StringVar(value="type")
         tk.Radiobutton(
-            mode_frame, text="Types (into Notepad)", variable=self.mode_var, value="type", command=self.on_mode_change
+            mode_frame, text="Types (into Word)", variable=self.mode_var, value="type", command=self.on_mode_change
         ).pack(side="left", padx=(6, 0))
         tk.Radiobutton(
             mode_frame, text="Sends (to another laptop)", variable=self.mode_var, value="send", command=self.on_mode_change
@@ -676,12 +624,21 @@ class App:
 
         path_frame = tk.Frame(self.type_container)
         path_frame.pack(fill="x", padx=10, pady=(0, 6))
-        tk.Label(path_frame, text="Notepad file:").pack(side="left")
+        tk.Label(path_frame, text="Word document:").pack(side="left")
         self.file_path_var = tk.StringVar()
         self.file_path_entry = tk.Entry(path_frame, textvariable=self.file_path_var)
         self.file_path_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
         self.browse_btn = tk.Button(path_frame, text="Browse...", command=self.browse_file)
         self.browse_btn.pack(side="left")
+
+        font_frame = tk.Frame(self.type_container)
+        font_frame.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(font_frame, text="Font:").pack(side="left")
+        self.font_name_var = tk.StringVar(value=WORD_DEFAULT_FONT_NAME)
+        tk.Entry(font_frame, textvariable=self.font_name_var, width=16).pack(side="left", padx=(6, 12))
+        tk.Label(font_frame, text="Size:").pack(side="left")
+        self.font_size_var = tk.IntVar(value=WORD_DEFAULT_FONT_SIZE)
+        tk.Spinbox(font_frame, from_=6, to=96, textvariable=self.font_size_var, width=4).pack(side="left", padx=(6, 0))
 
         control_frame = tk.Frame(self.type_container)
         control_frame.pack(fill="x", padx=10, pady=(0, 6))
@@ -753,8 +710,7 @@ class App:
 
         self.clipboard_watch_enabled = False
         self.last_clipboard_text = ""
-        self.notepad_hwnd = None
-        self.notepad_sticky_following = True  # see scroll_follow_loop
+        self.word_hwnd = None
 
         self.remote_config = load_remote_config()
         self.remote_watch_enabled = False
@@ -796,7 +752,6 @@ class App:
         threading.Thread(target=self.relay_health_loop, daemon=True).start()
         threading.Thread(target=self.heartbeat_sender_loop, daemon=True).start()
         threading.Thread(target=self.connection_status_ticker, daemon=True).start()
-        threading.Thread(target=self.scroll_follow_loop, daemon=True).start()
         threading.Thread(target=self.autosave_settings_loop, daemon=True).start()
         keyboard.add_hotkey(PAUSE_HOTKEY, self.on_pause_hotkey, suppress=True)
 
@@ -843,9 +798,9 @@ class App:
     # ---- settings persistence ----
 
     def apply_saved_settings(self, settings):
-        """Restores last-used mode/connection type/Notepad path/speed, and
-        re-enables whichever toggle was on when last saved, so a restart
-        doesn't require re-selecting everything - see
+        """Restores last-used mode/connection type/Word document path/
+        speed/font, and re-enables whichever toggle was on when last
+        saved, so a restart doesn't require re-selecting everything - see
         autosave_settings_loop for where these get saved. Called once at
         startup with whatever load_app_settings() found (an empty dict,
         and every setting left at its widget default, if this is the
@@ -862,6 +817,12 @@ class App:
         wpm = settings.get("wpm")
         if isinstance(wpm, int) and 20 <= wpm <= 300:
             self.wpm_var.set(wpm)
+        font_name = settings.get("font_name")
+        if font_name:
+            self.font_name_var.set(font_name)
+        font_size = settings.get("font_size")
+        if isinstance(font_size, int) and 6 <= font_size <= 96:
+            self.font_size_var.set(font_size)
 
         # Same handlers a user clicking the radio buttons would trigger -
         # syncs container visibility etc. Safe to call here since nothing
@@ -878,12 +839,12 @@ class App:
             self.toggle_send_clipboard_remote()
 
     def autosave_settings_loop(self):
-        """Periodically snapshots current mode/connection/path/speed/toggle
-        state to app_settings.json (rather than wiring a trace on every
-        relevant widget variable), and piggybacks the crash-log "still
-        alive" heartbeat on the same timer - see log_still_alive for why
-        that matters even though this loop isn't itself doing anything
-        related to crash detection."""
+        """Periodically snapshots current mode/connection/path/speed/font/
+        toggle state to app_settings.json (rather than wiring a trace on
+        every relevant widget variable), and piggybacks the crash-log
+        "still alive" heartbeat on the same timer - see log_still_alive
+        for why that matters even though this loop isn't itself doing
+        anything related to crash detection."""
         last_heartbeat_log = 0.0
         while True:
             time.sleep(5)
@@ -893,6 +854,8 @@ class App:
                     "connection_type": self.connection_type_var.get(),
                     "file_path": self.file_path_var.get(),
                     "wpm": self.wpm_var.get(),
+                    "font_name": self.font_name_var.get(),
+                    "font_size": self.font_size_var.get(),
                     "remote_watch_enabled": self.remote_watch_enabled,
                     "send_clipboard_remote_enabled": self.send_clipboard_remote_enabled,
                 }
@@ -994,7 +957,7 @@ class App:
     # ---- clipboard auto-type flow ----
 
     def browse_file(self):
-        path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        path = filedialog.asksaveasfilename(defaultextension=".docx", filetypes=[("Word documents", "*.docx"), ("All files", "*.*")])
         if path:
             self.file_path_var.set(path)
 
@@ -1002,18 +965,18 @@ class App:
         if not self.clipboard_watch_enabled:
             file_path = self.file_path_var.get().strip()
             if not file_path:
-                self.status_label.config(text="Select a Notepad file path first.")
+                self.status_label.config(text="Select a Word document path first.")
                 return
             self.clipboard_watch_enabled = True
             self.last_clipboard_text = self.safe_paste()
             self.watch_btn.config(text="Disable Clipboard Auto-Type")
             self.file_path_entry.config(state="disabled")
             self.browse_btn.config(state="disabled")
-            self.status_label.config(text="Opening Notepad...")
-            # Pre-launch/find Notepad now instead of waiting for the first
+            self.status_label.config(text="Opening Word...")
+            # Pre-launch/find Word now instead of waiting for the first
             # copy - that first launch is the slow part (spawning the
             # process and waiting for its window), so do it up front.
-            threading.Thread(target=self.prelaunch_notepad, args=(file_path,), daemon=True).start()
+            threading.Thread(target=self.prelaunch_word, args=(file_path,), daemon=True).start()
         else:
             self.clipboard_watch_enabled = False
             self.watch_btn.config(text="Enable Clipboard Auto-Type")
@@ -1030,10 +993,10 @@ class App:
 
     def clipboard_watch_loop(self):
         # Same reason as in AutoTyper._run - this is a spawned thread, and
-        # this thread also makes UI Automation calls directly (reading
-        # Notepad's existing text before a new job starts), so it needs its
-        # own init too.
-        auto.InitializeUIAutomationInCurrentThread()
+        # this thread also makes Word COM calls directly (reading the
+        # document's existing content before a new job starts), so it
+        # needs its own COM init too.
+        pythoncom.CoInitialize()
         while True:
             time.sleep(CLIPBOARD_POLL_SECONDS)
             if not self.clipboard_watch_enabled:
@@ -1054,9 +1017,9 @@ class App:
                     continue
                 # Only mark this text as "handled" if we actually managed to
                 # start typing it. Marking it handled unconditionally (as
-                # before) meant a transient failure - e.g. Notepad's UI
-                # Automation tree not being ready yet right after a fresh
-                # launch - would silently and PERMANENTLY blacklist that
+                # before) meant a transient failure - e.g. Word still
+                # starting up right after a fresh launch - would silently
+                # and PERMANENTLY blacklist that
                 # exact clipboard text: it would never be retried, even
                 # though the same copy would very likely succeed a second
                 # later. Re-copying identical text is indistinguishable from
@@ -1071,43 +1034,42 @@ class App:
                 self.on_status(f"Clipboard watcher error: {exc}")
 
     def handle_new_clipboard_text(self, text):
-        """Attempts to start typing `text` into Notepad, at the speed
-        slider's current setting - remote-triggered jobs use this same
-        speed, not a separate fixed pace. Appends after whatever's already
-        there (separated by ENTRY_SEPARATOR) rather than clearing it first -
-        if a prior job was interrupted mid-sentence (see remote_watch_loop),
-        that partial text is left exactly as it was, not wiped. Returns True
-        only if a typing job was actually started - the caller uses this to
-        decide whether this clipboard content may be safely considered
-        "handled", so a transient failure gets retried on the next poll
-        instead of being silently and permanently ignored."""
+        """Attempts to start typing `text` into the target Word document, at
+        the speed slider's current setting - remote-triggered jobs use this
+        same speed, not a separate fixed pace. Appends after whatever's
+        already there (separated by ENTRY_SEPARATOR) rather than clearing it
+        first - if a prior job was interrupted mid-sentence (see
+        remote_watch_loop), that partial text is left exactly as it was, not
+        wiped. Returns True only if a typing job was actually started - the
+        caller uses this to decide whether this clipboard content may be
+        safely considered "handled", so a transient failure gets retried on
+        the next poll instead of being silently and permanently ignored."""
         tokens = tokenize(text)
         if not any(is_word for is_word, _ in tokens):
             return True  # nothing to type, but not a failure - don't retry it
 
         file_path = self.file_path_var.get().strip()
         if not file_path:
-            self.on_status("Set a Notepad file path first, then copy again.")
+            self.on_status("Set a Word document path first, then copy again.")
             return False
 
         self.typer.stop_and_wait()
 
-        if not self.ensure_notepad_open(file_path):
+        if not self.ensure_word_open(file_path):
             return False
 
-        value_pattern = get_notepad_value_pattern(self.notepad_hwnd)
-        if value_pattern is None:
-            self.on_status("Could not find Notepad's text area - will retry.")
+        doc = get_word_document(file_path)
+        if doc is None:
+            self.on_status("Could not open the Word document - will retry.")
             return False
         try:
-            existing = value_pattern.Value or ""
+            needs_separator = bool(doc.Content.Text.strip())
         except Exception as exc:
-            self.on_status(f"Could not read Notepad's current text: {exc} - will retry.")
+            self.on_status(f"Could not read the Word document's current text: {exc} - will retry.")
             return False
-        prefix = existing + ENTRY_SEPARATOR if existing.strip() else ""
 
         try:
-            force_foreground(self.notepad_hwnd)
+            force_foreground(self.word_hwnd)
         except Exception:
             pass  # best-effort only - typing doesn't depend on this succeeding
 
@@ -1118,8 +1080,10 @@ class App:
             self.on_status,
             self.on_progress,
             self.on_done_auto,
-            prefix=prefix,
-            target_hwnd=self.notepad_hwnd,
+            file_path,
+            self.font_name_var.get().strip() or WORD_DEFAULT_FONT_NAME,
+            self.font_size_var.get(),
+            needs_separator,
         )
         return True
 
@@ -1135,7 +1099,7 @@ class App:
             return
         file_path = self.file_path_var.get().strip()
         if not file_path:
-            self.status_label.config(text="Select a Notepad file path first.")
+            self.status_label.config(text="Select a Word document path first.")
             return
         if self.connection_type_var.get() == "lan":
             port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)
@@ -1158,13 +1122,13 @@ class App:
         # actually been seen.
         self.type_last_peer_heartbeat = 0.0
         self.remote_btn.config(text="Disable Web Remote Trigger")
-        threading.Thread(target=self.prelaunch_notepad, args=(file_path,), daemon=True).start()
+        threading.Thread(target=self.prelaunch_word, args=(file_path,), daemon=True).start()
 
     def remote_watch_loop(self):
         # Same reason as clipboard_watch_loop/AutoTyper._run - this thread
-        # makes UI Automation calls (via handle_new_clipboard_text), so it
-        # needs its own UIA init too.
-        auto.InitializeUIAutomationInCurrentThread()
+        # makes Word COM calls (via handle_new_clipboard_text), so it needs
+        # its own COM init too.
+        pythoncom.CoInitialize()
         backoff = 1.0
         while True:
             # LAN mode doesn't use this SSE-based loop at all - incoming
@@ -1483,73 +1447,34 @@ class App:
             except Exception as exc:
                 self.on_status(f"Could not reach remote relay: {exc} - will retry.")
 
-    def ensure_notepad_open(self, file_path):
-        filename = os.path.basename(file_path)
-
-        # Always re-check for an already-open window matching this exact file
-        # first, rather than trusting a cached handle - launching notepad.exe
-        # again when it's already open can open a second window/tab instead
-        # of reusing the visible one.
-        hwnd = find_window_by_title_substring(filename, timeout=0.3)
-        if hwnd is not None:
-            self.notepad_hwnd = hwnd
-            return True
-
+    def ensure_word_open(self, file_path):
+        """Connects to (or launches) Word with the target document open,
+        via COM rather than window-title matching - get_word_document()
+        already handles "already open vs. needs opening/creating"
+        transparently, and reliably reconnects to the SAME Word instance
+        across threads/calls (see its docstring)."""
+        doc = get_word_document(file_path)
+        if doc is None:
+            self.on_status("Could not open the Word document.")
+            return False
         try:
-            if not os.path.exists(file_path):
-                open(file_path, "w").close()
-            subprocess.Popen(["notepad.exe", file_path])
-        except OSError as exc:
-            self.on_status(f"Could not open Notepad file: {exc}")
+            self.word_hwnd = doc.ActiveWindow.Hwnd
+        except Exception:
+            self.on_status("Could not find the Word window after opening it.")
             return False
-        hwnd = find_window_by_title_substring(filename)
-        if hwnd is None:
-            self.on_status("Could not find the Notepad window after opening it.")
-            return False
-        self.notepad_hwnd = hwnd
         return True
 
-    def prelaunch_notepad(self, file_path):
-        if self.ensure_notepad_open(file_path):
-            self.on_status("Watching clipboard - copy something to auto-type it into Notepad.")
-
-    def scroll_follow_loop(self):
-        """Keeps Notepad scrolled to follow along during a typing job,
-        independently of AutoTyper's own thread - see the comment in
-        AutoTyper._run's flush() for why scrolling can't just happen
-        inline there without capping effective typing speed well below
-        whatever WPM is configured. The actual follow/stop decision is
-        made by next_sticky_scroll_state (a pure function, easy to test
-        without a real Notepad window) - this method just feeds it live
-        state every tick and acts on the result.
-
-        self.notepad_sticky_following persists across jobs (not reset
-        when one starts/ends), since a manual scroll is about the user's
-        reading position in the file, not tied to any one job - it's
-        reset only when the target window itself changes."""
-        auto.InitializeUIAutomationInCurrentThread()
-        cached_hwnd = None
-        cached_text_pattern = None
-        last_seen_length = -1
-        while True:
-            time.sleep(1.0)
-            if not self.typer.is_running() or self.notepad_hwnd is None:
-                continue
-            if self.notepad_hwnd != cached_hwnd:
-                cached_text_pattern = get_notepad_text_pattern(self.notepad_hwnd, timeout=1.0)
-                cached_hwnd = self.notepad_hwnd
-                self.notepad_sticky_following = True
-                last_seen_length = -1
-
-            current_length = self.typer.last_flushed_length
-            content_grew = current_length != last_seen_length
-            last_seen_length = current_length
-
-            self.notepad_sticky_following, should_scroll = next_sticky_scroll_state(
-                self.notepad_sticky_following, content_grew, lambda: is_notepad_scrolled_to_end(cached_text_pattern)
-            )
-            if should_scroll:
-                scroll_notepad_to_end(cached_text_pattern)
+    def prelaunch_word(self, file_path):
+        # Runs on its own freshly-spawned thread (see toggle_watch /
+        # toggle_remote_watch) which hasn't touched COM before - same
+        # per-thread init requirement as every other Word-COM-touching
+        # thread in this app.
+        pythoncom.CoInitialize()
+        try:
+            if self.ensure_word_open(file_path):
+                self.on_status("Watching clipboard - copy something to auto-type it into Word.")
+        finally:
+            pythoncom.CoUninitialize()
 
     # ---- shared status/control helpers ----
 

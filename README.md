@@ -1,22 +1,22 @@
 # Clipboard Auto Typer
 
-A Windows desktop utility that watches your clipboard and automatically "types" whatever you copy into a chosen Notepad file, at a configurable, natural-looking pace.
+A Windows desktop utility that watches your clipboard and automatically "types" whatever you copy into a chosen Microsoft Word document, at a configurable, natural-looking pace.
 
-Copy text anywhere — an AI response, a document, dictated text — and it appears in Notepad progressively, as if it were being typed live, instead of pasted instantly.
+Copy text anywhere — an AI response, a document, dictated text — and it appears in Word progressively, as if it were being typed live, instead of pasted instantly.
 
 ## Features
 
-- **Clipboard-triggered**: copy text anywhere on your system and it starts appearing in Notepad automatically — no manual paste needed.
+- **Clipboard-triggered**: copy text anywhere on your system and it starts appearing in Word automatically — no manual paste needed.
 - **Adjustable typing speed** (20–300 WPM) via a slider.
+- **Customizable font**: set the font name and size typed text uses — a real, persistent Word document property, so it doesn't reset itself the way Notepad's zoom/display font used to.
 - **Pause / Resume**:
-  - Automatically pauses the moment you switch away from Notepad (e.g. to reply to a message), and resumes exactly where it left off once you switch back — so it never competes with you for keyboard input in another app.
+  - Automatically pauses the moment you switch away from Word (e.g. to reply to a message), and resumes exactly where it left off once you switch back — so it never competes with you for keyboard input in another app.
   - A global hotkey (`Ctrl+Alt+Insert`) also lets you pause/resume manually from any app.
-- **Reliable by construction**: text is written directly into Notepad's text control via Windows UI Automation rather than simulated keystrokes, so it can't drop or corrupt characters, and doesn't depend on which window happens to have focus at any given instant.
-- **Works with both** the modern Windows 11 (Store) Notepad and the classic `notepad.exe`.
-- Auto-launches Notepad with your chosen file if it isn't already open.
-- **Laptop-to-laptop**: copy on one Windows laptop and it types into Notepad on a second one, over the internet or a shared local network, within a second or two, at the receiving laptop's speed slider — see [Laptop-to-Laptop](#laptop-to-laptop) below.
-- **Mode switch**: each install of the app is either **Types** (writes to a local Notepad file) or **Sends** (relays its clipboard to another laptop in Types mode) — only the controls relevant to that role are shown, and a status line shows whether the relay connection is actually alive.
-- **Remembers your setup**: mode, connection type, Notepad path, speed, and whether a toggle was on are all restored automatically on the next launch — no need to re-select everything every time you restart the app.
+- **Reliable by construction**: text is written directly into the Word document via Word's COM automation (`Document.Content.InsertAfter`) rather than simulated keystrokes, so it can't drop or corrupt characters, and doesn't depend on which window happens to have focus at any given instant.
+- Auto-launches Word with your chosen document if it isn't already open.
+- **Laptop-to-laptop**: copy on one Windows laptop and it types into Word on a second one, over the internet or a shared local network, within a second or two, at the receiving laptop's speed slider — see [Laptop-to-Laptop](#laptop-to-laptop) below.
+- **Mode switch**: each install of the app is either **Types** (writes to a local Word document) or **Sends** (relays its clipboard to another laptop in Types mode) — only the controls relevant to that role are shown, and a status line shows whether the relay connection is actually alive.
+- **Remembers your setup**: mode, connection type, Word document path, speed, font, and whether a toggle was on are all restored automatically on the next launch — no need to re-select everything every time you restart the app.
 - **Runs in the background**: closing the window minimizes it to the system tray instead of quitting; right-click the tray icon for **Show Window** or **Exit**.
 - **Test Connection** button (Sends mode): checks connectivity on demand instead of waiting for the automatic status to update.
 - **Crash logging**: since the app runs without a visible console, any unexpected error is written to `crash.log` in the project folder instead of silently vanishing.
@@ -25,6 +25,7 @@ Copy text anywhere — an AI response, a document, dictated text — and it appe
 
 - Windows 10/11
 - Python 3.9+
+- Microsoft Word, on any laptop running in **Types** mode (typing happens via Word's own COM automation). **Sends** mode has no such requirement.
 
 ## Installation
 
@@ -40,12 +41,12 @@ pip install -r requirements.txt
 python main.py
 ```
 
-1. Choose (or browse to) the Notepad file you want text typed into.
-2. Set your preferred typing speed.
+1. Choose (or browse to) the Word document you want text typed into.
+2. Set your preferred typing speed and font.
 3. Click **Enable Clipboard Auto-Type**.
-4. Copy any text — it will appear in Notepad automatically, at the pace you set.
+4. Copy any text — it will appear in Word automatically, at the pace you set.
 
-While it's typing, switch to another app freely — generation pauses immediately and resumes exactly where it left off as soon as you switch back to Notepad.
+While it's typing, switch to another app freely — generation pauses immediately and resumes exactly where it left off as soon as you switch back to Word.
 
 ### Controls
 
@@ -57,7 +58,7 @@ While it's typing, switch to another app freely — generation pauses immediatel
 
 ## How it works
 
-The app polls the clipboard for changes on a background thread. When new text is detected, it locates (or launches) the target Notepad window and writes the text into it word by word via [UI Automation](https://learn.microsoft.com/en-us/windows/win32/winauto/entry-uiautomation-win32), rather than simulating keystrokes — this is what makes typing reliable and focus-independent, while pause/resume is layered on top as a deliberate choice so the tool never interferes with input in whatever app you're actually using.
+The app polls the clipboard for changes on a background thread. When new text is detected, it connects to (or launches) Word via [COM automation](https://learn.microsoft.com/en-us/office/vba/api/word.document) and appends the text word by word using `Document.Content.InsertAfter`, rather than simulating keystrokes — this is what makes typing reliable and focus-independent, while pause/resume is layered on top as a deliberate choice so the tool never interferes with input in whatever app you're actually using.
 
 ## Laptop-to-Laptop
 
@@ -81,21 +82,21 @@ Copy-paste normally only works on the same machine. This app can relay clipboard
      "lan_receiver_ip": ""
    }
    ```
-   This file is git-ignored and never uploaded anywhere — keep it private, since anyone with the secret could type into your Notepad. `topic` is only used by Internet Relay; `lan_port`/`lan_receiver_ip` only by LAN (the default port rarely needs changing, and `lan_receiver_ip` gets filled in automatically the first time you use LAN mode as the sender — see below).
+   This file is git-ignored and never uploaded anywhere — keep it private, since anyone with the secret could type into your Word document. `topic` is only used by Internet Relay; `lan_port`/`lan_receiver_ip` only by LAN (the default port rarely needs changing, and `lan_receiver_ip` gets filled in automatically the first time you use LAN mode as the sender — see below).
 
 ### Using it (Internet Relay)
 
-1. On the **receiving** laptop: select **This laptop: Types** and **Connection: Internet Relay**, set the Notepad file path, click **Enable Web Remote Trigger**.
+1. On the **receiving** laptop: select **This laptop: Types** and **Connection: Internet Relay**, set the Word document path, click **Enable Web Remote Trigger**.
 2. On the **sending** laptop: select **This laptop: Sends** and **Connection: Internet Relay**, click **Send Clipboard to Remote Laptop**.
 3. Both sides' status lines show **Connected** within a few seconds once both are running — this means each side has actually confirmed it's hearing from the other, not just that it can reach the relay.
-4. Copy anything on the sending laptop — it appears on the receiving laptop's Notepad within a second or two, at the receiving laptop's speed slider setting.
+4. Copy anything on the sending laptop — it appears in the receiving laptop's Word document within a second or two, at the receiving laptop's speed slider setting.
 
 ### Using it (Local Network / LAN)
 
-1. On the **receiving** laptop: select **This laptop: Types** and **Connection: Local Network (LAN)**, set the Notepad file path, click **Enable Web Remote Trigger**. The status line shows the laptop's own LAN address, e.g. `Listening on 192.168.1.42:8765 - waiting for sending laptop...`.
+1. On the **receiving** laptop: select **This laptop: Types** and **Connection: Local Network (LAN)**, set the Word document path, click **Enable Web Remote Trigger**. The status line shows the laptop's own LAN address, e.g. `Listening on 192.168.1.42:8765 - waiting for sending laptop...`.
 2. On the **sending** laptop: select **This laptop: Sends** and **Connection: Local Network (LAN)**, enter the receiving laptop's IP (shown in step 1) into **Receiver's LAN IP**, click **Send Clipboard to Remote Laptop**. That IP is remembered in `remote_config.json` for next time.
 3. Both sides show **Connected** once a message has actually gone through.
-4. Copy anything on the sending laptop — it appears on the receiving laptop's Notepad within a second or two, at the receiving laptop's speed slider setting.
+4. Copy anything on the sending laptop — it appears in the receiving laptop's Word document within a second or two, at the receiving laptop's speed slider setting.
 
 Switching a laptop's mode or connection type automatically turns off whatever was previously running (e.g. selecting **Sends** stops **Enable Web Remote Trigger** if it was on; switching from Internet Relay to LAN stops an active internet-relay connection), since a laptop can only really play one role, on one transport, at a time.
 

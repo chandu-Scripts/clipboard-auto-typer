@@ -35,7 +35,7 @@ ENTRY_SEPARATOR = "\n" + "-" * 40 + "\n\n"
 # that) and avoid F10 (Windows treats it as a special system key that can
 # activate a window's menu bar on its own, which is what opened a new
 # untitled file via File > New). Insert has neither problem.
-PAUSE_HOTKEY = "ctrl+alt+insert"
+PAUSE_HOTKEY = "ctrl+alt+p"
 HOTKEY_DEBOUNCE_SECONDS = 0.5
 
 # Typing is done via Word's COM automation (Document.Content.InsertAfter),

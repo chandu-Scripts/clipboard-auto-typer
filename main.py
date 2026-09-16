@@ -29,7 +29,7 @@ CLIPBOARD_POLL_SECONDS = 0.15
 # newly started one, since entries are no longer cleared - a full dashed
 # line plus a blank line makes the cutoff point visually obvious rather
 # than just a plain blank line.
-ENTRY_SEPARATOR = "\n" + "-" * 40 + "\n\n"
+ENTRY_SEPARATOR = "\n" + "-" * 40 + "\n"
 # Avoid letters (ctrl+<letter> can leak through as a real shortcut on a
 # mistimed press - ctrl+alt+p briefly looking like ctrl+p = Print was exactly
 # that) and avoid F10 (Windows treats it as a special system key that can

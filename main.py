@@ -1374,20 +1374,27 @@ class App:
 
     def toggle_watch(self):
         if not self.clipboard_watch_enabled:
+            output = self.output_var.get()
+            use_word = output in ("word", "both")
             file_path = self.file_path_var.get().strip()
-            if not file_path:
+            if use_word and not file_path:
                 self.status_label.config(text="Select a Word document path first.")
+                return
+            if output in ("web", "both") and not self.start_board_server():
                 return
             self.clipboard_watch_enabled = True
             self.last_clipboard_text = self.safe_paste()
             self.watch_btn.config(text="Disable Clipboard Auto-Type")
             self.file_path_entry.config(state="disabled")
             self.browse_btn.config(state="disabled")
-            self.status_label.config(text="Opening Word...")
-            # Pre-launch/find Word now instead of waiting for the first
-            # copy - that first launch is the slow part (spawning the
-            # process and waiting for its window), so do it up front.
-            threading.Thread(target=self.prelaunch_word, args=(file_path,), daemon=True).start()
+            if use_word:
+                self.status_label.config(text="Opening Word...")
+                # Pre-launch/find Word now instead of waiting for the first
+                # copy - that first launch is the slow part (spawning the
+                # process and waiting for its window), so do it up front.
+                threading.Thread(target=self.prelaunch_word, args=(file_path,), daemon=True).start()
+            else:
+                self.status_label.config(text=f"Watching clipboard - Answer Board: {BOARD_URL}")
         else:
             self.clipboard_watch_enabled = False
             self.watch_btn.config(text="Enable Clipboard Auto-Type")

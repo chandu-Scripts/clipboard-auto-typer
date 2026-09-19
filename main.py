@@ -127,6 +127,7 @@ BOARD_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "boar
 BOARD_URL = f"http://localhost:{BOARD_PORT}/"
 BOARD_WINDOW_TITLE = "Answer Board"  # must match <title> in board.html
 BOARD_MAX_CHARS = 2_000_000
+BOARD_MAX_SPOKEN_BYTES = 20_000  # one recognized phrase is a sentence or two, never this big
 BOARD_KEEPALIVE_SECONDS = 15
 
 TOKEN_PATTERN = re.compile(r"\S+|\s+")
@@ -439,14 +440,30 @@ class BoardHub:
         if not chunk:
             return
         with self._lock:
-            self._text += chunk
-            if len(self._text) > BOARD_MAX_CHARS:
-                self._text = self._text[-BOARD_MAX_CHARS:]
-                # Pages hold the untrimmed text - resync them all instead
-                # of sending a chunk they'd append to the wrong base.
-                self._broadcast_locked("snapshot", self._snapshot_locked())
-                return
-            self._broadcast_locked("append", chunk)
+            self._append_locked(chunk)
+
+    def append_spoken(self, phrase):
+        """Adds a finished phrase from the page's microphone. Starts a new
+        phrase with a space unless the board is empty or already ends in
+        whitespace (e.g. right after a typed answer's newline), so words
+        never run together. Returns False if there was nothing to add."""
+        phrase = phrase.strip()
+        if not phrase:
+            return False
+        with self._lock:
+            needs_space = bool(self._text) and not self._text[-1].isspace()
+            self._append_locked((" " if needs_space else "") + phrase)
+        return True
+
+    def _append_locked(self, chunk):
+        self._text += chunk
+        if len(self._text) > BOARD_MAX_CHARS:
+            self._text = self._text[-BOARD_MAX_CHARS:]
+            # Pages hold the untrimmed text - resync them all instead
+            # of sending a chunk they'd append to the wrong base.
+            self._broadcast_locked("snapshot", self._snapshot_locked())
+            return
+        self._broadcast_locked("append", chunk)
 
     def clear(self):
         with self._lock:
@@ -568,11 +585,35 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         # A custom header makes this a non-simple request, which a browser
         # won't let another website send cross-origin.
-        if path == "/clear" and self.headers.get("X-Board") == "1":
+        if self.headers.get("X-Board") != "1":
+            self._reply(404, b"Not found")
+        elif path == "/clear":
             self.server.hub.clear()
             self._reply(204)
+        elif path == "/append":
+            self._append_spoken()
         else:
             self._reply(404, b"Not found")
+
+    def _append_spoken(self):
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._reply(400, b"Content-Length required")
+            return
+        if length < 0 or length > BOARD_MAX_SPOKEN_BYTES:
+            self._reply(413, b"Too large")
+            return
+        try:
+            text = json.loads(self.rfile.read(length).decode("utf-8")).get("text")
+        except (ValueError, AttributeError):
+            self._reply(400, b"Expected JSON like {\"text\": \"...\"}")
+            return
+        if not isinstance(text, str):
+            self._reply(400, b"text must be a string")
+            return
+        self.server.hub.append_spoken(text)
+        self._reply(204)
 
     def _send_event(self, event, data):
         payload = json.dumps(data)  # one line: json escapes newlines

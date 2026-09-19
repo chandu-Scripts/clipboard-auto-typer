@@ -89,6 +89,13 @@
   .size { min-width: 52px; text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
   select { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
 
+  #mic { display: inline-flex; align-items: center; gap: 8px; }
+  #mic .dot { background: var(--muted); }
+  #mic.live { border-color: var(--bad); }
+  #mic.live .dot { background: var(--bad); animation: pulse 1.1s ease-in-out infinite; }
+  @media (prefers-reduced-motion: reduce) { #mic.live .dot { animation: none; } }
+  #interim { color: var(--muted); font-style: italic; }
+
   .reader { position: relative; min-height: 0; }
   #text {
     position: absolute; inset: 0; overflow: auto;
@@ -149,6 +156,10 @@
       </span>
       <select id="font" aria-label="Font"></select>
       <button id="fullscreen">Fullscreen</button>
+      <span class="group">
+        <button id="mic" aria-pressed="false" title="Speak to add text to the board"><span class="dot"></span><span id="mic-text">Start listening</span></button>
+        <select id="lang" aria-label="Speech language"></select>
+      </span>
       <span class="spacer"></span>
       <button id="copy">Copy</button>
       <button id="save" class="primary">Save to history</button>
@@ -156,7 +167,7 @@
     </div>
     <div class="reader">
       <div id="text" tabindex="0" aria-label="Answers"></div>
-      <div id="empty"><div><strong>Waiting for answers</strong>Text sent from the app appears here as it is typed.</div></div>
+      <div id="empty"><div><strong>Waiting for answers</strong>Text sent from the app appears here as it is typed, or press “Start listening” to speak.</div></div>
       <button id="jump" class="primary">Jump to latest ↓</button>
     </div>
   </section>
@@ -213,11 +224,17 @@
   var textEl = $("text");
   var textNode = document.createTextNode("");
   textEl.appendChild(textNode);
+  // Words the microphone is still working out. Kept after the real text
+  // node, and never part of it, so Copy/Save only ever see finished text.
+  var interimEl = document.createElement("span");
+  interimEl.id = "interim";
+  textEl.appendChild(interimEl);
   var following = true;
   var scrollQueued = false;
 
   function updateEmpty() {
-    $("empty").style.display = textNode.data.length ? "none" : "grid";
+    var has = textNode.data.length > 0 || interimEl.textContent.length > 0;
+    $("empty").style.display = has ? "none" : "grid";
   }
   function atBottom() {
     return textEl.scrollHeight - textEl.scrollTop - textEl.clientHeight <= 48;
@@ -260,8 +277,11 @@
     textEl.style.fontFamily = css;
     $("size").textContent = size + "px";
     fontSelect.value = fontName;
-    store(PREFS_KEY, { size: size, font: fontName });
+    savePrefs();
     if (following) followIfNeeded();
+  }
+  function savePrefs() {
+    store(PREFS_KEY, { size: size, font: fontName, lang: prefs.lang });
   }
   $("smaller").addEventListener("click", function () { size = Math.max(12, size - 2); applyPrefs(); });
   $("bigger").addEventListener("click", function () { size = Math.min(72, size + 2); applyPrefs(); });
@@ -314,6 +334,124 @@
   });
   source.addEventListener("status", function (e) { setStatus(JSON.parse(e.data)); });
   updateEmpty();
+
+  // ---- speech: the browser's built-in recognizer, finished phrases go to the app ----
+  var LANGS = [
+    ["English (India)", "en-IN"], ["English (US)", "en-US"], ["English (UK)", "en-GB"],
+    ["Hindi", "hi-IN"], ["Telugu", "te-IN"], ["Tamil", "ta-IN"],
+    ["Spanish", "es-ES"], ["French", "fr-FR"], ["German", "de-DE"]
+  ];
+  var langSelect = $("lang");
+  LANGS.forEach(function (l) {
+    var o = document.createElement("option");
+    o.value = l[1]; o.textContent = l[0];
+    langSelect.appendChild(o);
+  });
+  langSelect.value = LANGS.some(function (l) { return l[1] === prefs.lang; }) ? prefs.lang : "en-IN";
+  langSelect.addEventListener("change", function () {
+    prefs.lang = langSelect.value;
+    savePrefs();
+    if (listening) { restartRecognizer(); }
+  });
+
+  var micBtn = $("mic");
+  var recog = null;
+  var listening = false;       // what the user asked for; the browser may stop on its own
+  var quickEnds = 0;           // recognizer ended almost immediately, repeatedly
+  var lastStart = 0;
+
+  // Looked up when used, not at load, so it can be swapped for a test double.
+  function getRecognizer() { return window.SpeechRecognition || window.webkitSpeechRecognition; }
+
+  function setInterim(text) {
+    var t = text.trim();
+    // Same spacing rule the app applies to finished phrases, so the words
+    // don't jump when they turn into real text.
+    var needsSpace = t && textNode.data && !/\s$/.test(textNode.data);
+    interimEl.textContent = t ? (needsSpace ? " " : "") + t : "";
+    updateEmpty();
+    followIfNeeded();
+  }
+  function updateMic() {
+    micBtn.classList.toggle("live", listening);
+    micBtn.setAttribute("aria-pressed", String(listening));
+    $("mic-text").textContent = listening ? "Stop listening" : "Start listening";
+  }
+  function sendPhrase(text) {
+    text = text.trim();
+    if (!text) return;
+    fetch("/append", {
+      method: "POST",
+      headers: { "X-Board": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text })
+    }).then(function (r) {
+      if (!r.ok) throw new Error("bad status");
+    }).catch(function () { toast("Could not add spoken text - is the app running?"); });
+  }
+  function stopListening(message) {
+    listening = false;
+    if (recog) { try { recog.abort(); } catch (e) { /* already stopped */ } }
+    recog = null;
+    setInterim("");
+    updateMic();
+    if (message) toast(message);
+  }
+  function startRecognizer() {
+    var Rec = getRecognizer();
+    recog = new Rec();
+    recog.lang = langSelect.value;
+    recog.continuous = true;
+    recog.interimResults = true;
+    var mine = recog;
+    recog.onresult = function (e) {
+      var interim = "";
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        var r = e.results[i];
+        if (r.isFinal) { sendPhrase(r[0].transcript); } else { interim += r[0].transcript; }
+      }
+      setInterim(interim);
+    };
+    recog.onerror = function (e) {
+      if (e.error === "no-speech" || e.error === "aborted") return;
+      var reasons = {
+        "not-allowed": "Microphone is blocked - allow it in the address bar, then try again",
+        "service-not-allowed": "Speech recognition is blocked in this browser",
+        "audio-capture": "No microphone found",
+        "network": "Speech service unreachable - it needs an internet connection"
+      };
+      if (mine === recog) stopListening(reasons[e.error] || "Speech error: " + e.error);
+    };
+    recog.onend = function () {
+      if (mine !== recog) return;       // replaced or stopped on purpose
+      setInterim("");
+      if (!listening) return;
+      // The browser ends a session after a stretch of silence; carry on.
+      quickEnds = (Date.now() - lastStart < 1000) ? quickEnds + 1 : 0;
+      if (quickEnds >= 3) { stopListening("Listening keeps stopping - check your microphone"); return; }
+      setTimeout(function () { if (listening && mine === recog) startRecognizer(); }, 250);
+    };
+    lastStart = Date.now();
+    try { recog.start(); } catch (e) { stopListening("Could not start listening"); }
+  }
+  function restartRecognizer() {
+    var old = recog;
+    recog = null;
+    if (old) { try { old.abort(); } catch (e) { /* already stopped */ } }
+    startRecognizer();
+  }
+  micBtn.addEventListener("click", function () {
+    if (listening) { stopListening(); return; }
+    if (!getRecognizer()) { toast("Speech needs Chrome or Edge"); return; }
+    listening = true;
+    quickEnds = 0;
+    updateMic();
+    startRecognizer();
+  });
+  if (!getRecognizer()) {
+    micBtn.title = "Speech recognition needs Chrome or Edge";
+    micBtn.disabled = true;
+    langSelect.disabled = true;
+  }
 
   // ---- copy / save / clear ----
   function copyText(text, doneMessage) {

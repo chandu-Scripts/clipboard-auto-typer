@@ -358,7 +358,8 @@
       timer = setTimeout(function () { button.classList.remove("armed"); button.textContent = idleLabel; }, 3000);
     });
   }
-  twoStep($("clear"), "Clear", "Click again to clear", function () {
+  $("clear").addEventListener("click", function () {
+    if (!textNode.data) { toast("Nothing to clear"); return; }
     fetch("/clear", { method: "POST", headers: { "X-Board": "1" } }).then(function (r) {
       if (!r.ok) throw new Error("bad status");
       toast("Cleared");

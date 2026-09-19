@@ -76,7 +76,7 @@ Click **Open Answer Board** (or browse to `http://localhost:8766/`). The page:
 
 - shows text as it is typed, following the newest text — scroll up to read earlier text and it stops following until you press **Jump to latest** or scroll back to the bottom;
 - mirrors the typing status (Typing · 12/71 words, Paused, Done, Stopped), including pause/resume;
-- has text size (A− / A+), a font picker, **Fullscreen**, **Copy**, **Save to history**, and **Clear** (asks twice);
+- has text size (A− / A+), a font picker, **Fullscreen**, **Copy**, **Save to history**, and **Clear** (one click);
 - keeps a **History** tab of saved answers with search — stored in your browser only.
 
 It is served from the same laptop that is typing, on `127.0.0.1` only, so other devices on the network cannot open it. With **Both**, the pause-when-you-leave-Word behaviour also treats the Answer Board's browser window as "focused", so watching the board doesn't pause typing. With **Web page** alone there is no Word window to watch, so only the Pause button, hotkey, and Stop apply.

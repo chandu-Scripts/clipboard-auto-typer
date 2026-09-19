@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Answer Board</title>
+<style>
+  :root {
+    --bg: #12141a;
+    --panel: #191c24;
+    --panel-2: #20242e;
+    --line: #2b303c;
+    --text: #e8e6e1;
+    --muted: #8c93a3;
+    --accent: #f2b34a;
+    --accent-ink: #1a1305;
+    --ok: #5cc08a;
+    --info: #6aa8ff;
+    --bad: #ef6b6b;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 "Segoe UI", system-ui, -apple-system, sans-serif;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    overflow: hidden;
+  }
+  button, select, input { font: inherit; color: inherit; }
+  button {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  button:hover { border-color: #444b5c; }
+  button:focus-visible, select:focus-visible, input:focus-visible, .tab:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  button.danger.armed { background: var(--bad); border-color: var(--bad); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 10px 18px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { font-weight: 700; font-size: 16px; letter-spacing: .02em; }
+  .brand span { color: var(--accent); }
+  nav { display: flex; gap: 4px; margin-left: 8px; }
+  .tab {
+    background: none; border: 0; border-radius: 8px; padding: 6px 12px; color: var(--muted);
+  }
+  .tab[aria-selected="true"] { background: var(--panel-2); color: var(--text); }
+  .spacer { flex: 1; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 4px 12px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line);
+    font-variant-numeric: tabular-nums;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .pill[data-state="typing"] .dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+  .pill[data-state="paused"] .dot { background: var(--info); }
+  .pill[data-state="done"] .dot { background: var(--ok); }
+  .pill[data-state="stopped"] .dot { background: var(--bad); }
+  .link { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  .link .dot { background: var(--bad); }
+  .link.up .dot { background: var(--ok); }
+  @keyframes pulse { 50% { opacity: .35; transform: scale(.8); } }
+  @media (prefers-reduced-motion: reduce) { .pill[data-state="typing"] .dot { animation: none; } }
+
+  main { min-height: 0; display: grid; }
+  section { min-height: 0; display: none; }
+  section.active { display: grid; }
+
+  #live { grid-template-rows: auto 1fr; }
+  .toolbar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 18px; border-bottom: 1px solid var(--line);
+  }
+  .group { display: inline-flex; align-items: center; gap: 4px; }
+  .size { min-width: 52px; text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
+  select { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+
+  .reader { position: relative; min-height: 0; }
+  #text {
+    position: absolute; inset: 0; overflow: auto;
+    padding: 24px max(18px, calc((100% - 1000px) / 2));
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    line-height: 1.55;
+  }
+  #empty {
+    position: absolute; inset: 0; display: grid; place-content: center; text-align: center;
+    color: var(--muted); pointer-events: none; padding: 24px;
+  }
+  #empty strong { display: block; font-size: 18px; color: var(--text); margin-bottom: 6px; }
+  #jump {
+    position: absolute; right: 22px; bottom: 18px; display: none;
+    box-shadow: 0 6px 20px rgba(0,0,0,.4);
+  }
+  #jump.show { display: block; }
+
+  #history { grid-template-rows: auto 1fr; }
+  .h-tools { display: flex; gap: 8px; align-items: center; padding: 12px 18px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  #search { flex: 1; min-width: 200px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+  #entries { overflow: auto; padding: 14px max(18px, calc((100% - 1000px) / 2)); display: grid; gap: 10px; align-content: start; }
+  .entry { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; }
+  .entry-head { display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+  .entry-head .spacer { flex: 1; }
+  .entry-body { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 5.2em; overflow: hidden; }
+  .entry.open .entry-body { max-height: none; }
+  .entry-head button { padding: 3px 9px; font-size: 12px; }
+  .none { color: var(--muted); text-align: center; padding: 48px 0; }
+
+  #toast {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 14px; opacity: 0; pointer-events: none; transition: opacity .2s;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Answer<span>Board</span></div>
+  <nav role="tablist" aria-label="Views">
+    <button class="tab" role="tab" id="tab-live" aria-selected="true" aria-controls="live">Live</button>
+    <button class="tab" role="tab" id="tab-history" aria-selected="false" aria-controls="history">History</button>
+  </nav>
+  <div class="spacer"></div>
+  <span class="link" id="link" title="Connection to the app"><span class="dot"></span><span id="link-text">Connecting…</span></span>
+  <span class="pill" id="pill" data-state="idle" role="status" aria-live="polite"><span class="dot"></span><span id="pill-text">Idle</span></span>
+</header>
+
+<main>
+  <section id="live" class="active" role="tabpanel" aria-labelledby="tab-live">
+    <div class="toolbar">
+      <span class="group">
+        <button id="smaller" aria-label="Decrease text size">A−</button>
+        <span class="size" id="size">22px</span>
+        <button id="bigger" aria-label="Increase text size">A+</button>
+      </span>
+      <select id="font" aria-label="Font"></select>
+      <button id="fullscreen">Fullscreen</button>
+      <span class="spacer"></span>
+      <button id="copy">Copy</button>
+      <button id="save" class="primary">Save to history</button>
+      <button id="clear" class="danger">Clear</button>
+    </div>
+    <div class="reader">
+      <div id="text" tabindex="0" aria-label="Answers"></div>
+      <div id="empty"><div><strong>Waiting for answers</strong>Text sent from the app appears here as it is typed.</div></div>
+      <button id="jump" class="primary">Jump to latest ↓</button>
+    </div>
+  </section>
+
+  <section id="history" role="tabpanel" aria-labelledby="tab-history">
+    <div class="h-tools">
+      <input id="search" type="search" placeholder="Search saved answers…" aria-label="Search saved answers">
+      <span id="count" class="size"></span>
+      <button id="clear-all" class="danger">Delete all</button>
+    </div>
+    <div id="entries"></div>
+  </section>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var HISTORY_KEY = "answerboard.history.v1";
+  var PREFS_KEY = "answerboard.prefs.v1";
+  var MAX_ENTRIES = 300;
+  var FONTS = [
+    ["Consolas", '"Consolas", "Cascadia Mono", monospace'],
+    ["Cascadia Mono", '"Cascadia Mono", "Consolas", monospace'],
+    ["Courier New", '"Courier New", monospace'],
+    ["Segoe UI", '"Segoe UI", system-ui, sans-serif'],
+    ["Calibri", '"Calibri", "Segoe UI", sans-serif'],
+    ["Arial", 'Arial, Helvetica, sans-serif'],
+    ["Verdana", 'Verdana, sans-serif'],
+    ["Georgia", 'Georgia, serif'],
+    ["Times New Roman", '"Times New Roman", Times, serif']
+  ];
+
+  // ---- storage helpers (localStorage can be blocked or full - never throw) ----
+  function load(key, fallback) {
+    try { var v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch (e) { return fallback; }
+  }
+  function store(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); return true; } catch (e) { return false; }
+  }
+
+  // ---- toast ----
+  var toastTimer = null;
+  function toast(message) {
+    var el = $("toast");
+    el.textContent = message;
+    el.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.classList.remove("show"); }, 2200);
+  }
+
+  // ---- reading area ----
+  var textEl = $("text");
+  var textNode = document.createTextNode("");
+  textEl.appendChild(textNode);
+  var following = true;
+  var scrollQueued = false;
+
+  function updateEmpty() {
+    $("empty").style.display = textNode.data.length ? "none" : "grid";
+  }
+  function atBottom() {
+    return textEl.scrollHeight - textEl.scrollTop - textEl.clientHeight <= 48;
+  }
+  function updateJump() {
+    $("jump").classList.toggle("show", !following && textNode.data.length > 0);
+  }
+  function followIfNeeded() {
+    if (!following || scrollQueued) return;
+    scrollQueued = true;
+    requestAnimationFrame(function () {
+      scrollQueued = false;
+      textEl.scrollTop = textEl.scrollHeight;
+    });
+  }
+  textEl.addEventListener("scroll", function () {
+    // Scrolling up stops the auto-follow; reaching the bottom again resumes it.
+    following = atBottom();
+    updateJump();
+  });
+  $("jump").addEventListener("click", function () {
+    following = true;
+    textEl.scrollTop = textEl.scrollHeight;
+    updateJump();
+  });
+
+  // ---- preferences: text size + font ----
+  var prefs = load(PREFS_KEY, {});
+  var size = Math.min(72, Math.max(12, Number(prefs.size) || 22));
+  var fontName = FONTS.some(function (f) { return f[0] === prefs.font; }) ? prefs.font : FONTS[0][0];
+  var fontSelect = $("font");
+  FONTS.forEach(function (f) {
+    var o = document.createElement("option");
+    o.value = f[0]; o.textContent = f[0];
+    fontSelect.appendChild(o);
+  });
+  function applyPrefs() {
+    var css = FONTS.filter(function (f) { return f[0] === fontName; })[0][1];
+    textEl.style.fontSize = size + "px";
+    textEl.style.fontFamily = css;
+    $("size").textContent = size + "px";
+    fontSelect.value = fontName;
+    store(PREFS_KEY, { size: size, font: fontName });
+    if (following) followIfNeeded();
+  }
+  $("smaller").addEventListener("click", function () { size = Math.max(12, size - 2); applyPrefs(); });
+  $("bigger").addEventListener("click", function () { size = Math.min(72, size + 2); applyPrefs(); });
+  fontSelect.addEventListener("change", function () { fontName = fontSelect.value; applyPrefs(); });
+  applyPrefs();
+
+  $("fullscreen").addEventListener("click", function () {
+    if (document.fullscreenElement) { document.exitFullscreen(); }
+    else if (document.documentElement.requestFullscreen) { document.documentElement.requestFullscreen(); }
+  });
+
+  // ---- status pill ----
+  var LABELS = { idle: "Idle", typing: "Typing", paused: "Paused", done: "Done", stopped: "Stopped" };
+  function setStatus(s) {
+    var state = LABELS[s.state] ? s.state : "idle";
+    var label = LABELS[state];
+    if ((state === "typing" || state === "paused") && s.total) label += " · " + s.done + "/" + s.total + " words";
+    $("pill").setAttribute("data-state", state);
+    $("pill-text").textContent = label;
+  }
+
+  // ---- live stream from the app ----
+  var linkEl = $("link");
+  function setLink(up) {
+    linkEl.classList.toggle("up", up);
+    $("link-text").textContent = up ? "Connected" : "Reconnecting…";
+  }
+  var source = new EventSource("/stream");
+  source.onopen = function () { setLink(true); };
+  source.onerror = function () { setLink(false); };
+  source.addEventListener("snapshot", function (e) {
+    var d = JSON.parse(e.data);
+    textNode.data = d.text;
+    setStatus(d.status);
+    updateEmpty();
+    if (following) followIfNeeded();
+    updateJump();
+  });
+  source.addEventListener("append", function (e) {
+    textNode.appendData(JSON.parse(e.data));
+    updateEmpty();
+    followIfNeeded();
+    updateJump();
+  });
+  source.addEventListener("clear", function () {
+    textNode.data = "";
+    following = true;
+    updateEmpty();
+    updateJump();
+  });
+  source.addEventListener("status", function (e) { setStatus(JSON.parse(e.data)); });
+  updateEmpty();
+
+  // ---- copy / save / clear ----
+  function copyText(text, doneMessage) {
+    function fallback() {
+      var ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      toast(ok ? doneMessage : "Could not copy");
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { toast(doneMessage); }, fallback);
+    } else { fallback(); }
+  }
+  $("copy").addEventListener("click", function () {
+    if (!textNode.data) { toast("Nothing to copy yet"); return; }
+    copyText(textNode.data, "Copied");
+  });
+  $("save").addEventListener("click", function () {
+    var text = textNode.data;
+    if (!text.trim()) { toast("Nothing to save yet"); return; }
+    var list = load(HISTORY_KEY, []);
+    list.unshift({ id: Date.now() + "-" + Math.random().toString(36).slice(2, 7), ts: Date.now(), text: text });
+    if (list.length > MAX_ENTRIES) list.length = MAX_ENTRIES;
+    toast(store(HISTORY_KEY, list) ? "Saved to history" : "Could not save (browser storage is full or blocked)");
+    if ($("history").classList.contains("active")) renderHistory();
+  });
+
+  // A destructive button asks twice: first click arms it for 3 seconds.
+  function twoStep(button, idleLabel, armedLabel, action) {
+    var timer = null;
+    button.addEventListener("click", function () {
+      if (button.classList.contains("armed")) {
+        clearTimeout(timer);
+        button.classList.remove("armed"); button.textContent = idleLabel;
+        action();
+        return;
+      }
+      button.classList.add("armed"); button.textContent = armedLabel;
+      timer = setTimeout(function () { button.classList.remove("armed"); button.textContent = idleLabel; }, 3000);
+    });
+  }
+  twoStep($("clear"), "Clear", "Click again to clear", function () {
+    fetch("/clear", { method: "POST", headers: { "X-Board": "1" } }).then(function (r) {
+      if (!r.ok) throw new Error("bad status");
+      toast("Cleared");
+    }).catch(function () { toast("Could not clear - is the app running?"); });
+  });
+
+  // ---- history view ----
+  var openIds = {};
+  function fmt(ts) {
+    return new Date(ts).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+  }
+  function renderHistory() {
+    var all = load(HISTORY_KEY, []);
+    var q = $("search").value.trim().toLowerCase();
+    var list = q ? all.filter(function (e) { return e.text.toLowerCase().indexOf(q) !== -1; }) : all;
+    $("count").textContent = all.length + " saved";
+    $("clear-all").disabled = all.length === 0;
+    var box = $("entries");
+    box.textContent = "";
+    if (!list.length) {
+      var none = document.createElement("div");
+      none.className = "none";
+      none.textContent = all.length ? "No saved answers match your search." : "No saved answers yet. Use “Save to history” on the Live view.";
+      box.appendChild(none);
+      return;
+    }
+    list.forEach(function (e) {
+      var card = document.createElement("div");
+      card.className = "entry" + (openIds[e.id] ? " open" : "");
+      var head = document.createElement("div");
+      head.className = "entry-head";
+      var when = document.createElement("span");
+      when.textContent = fmt(e.ts) + " · " + e.text.length.toLocaleString() + " characters";
+      var sp = document.createElement("span"); sp.className = "spacer";
+      var toggle = document.createElement("button");
+      toggle.textContent = openIds[e.id] ? "Collapse" : "Expand";
+      toggle.addEventListener("click", function () {
+        openIds[e.id] = !openIds[e.id];
+        renderHistory();
+      });
+      var cp = document.createElement("button");
+      cp.textContent = "Copy";
+      cp.addEventListener("click", function () { copyText(e.text, "Copied"); });
+      var del = document.createElement("button");
+      del.textContent = "Delete";
+      del.addEventListener("click", function () {
+        store(HISTORY_KEY, load(HISTORY_KEY, []).filter(function (x) { return x.id !== e.id; }));
+        renderHistory();
+      });
+      head.append(when, sp, toggle, cp, del);
+      var body = document.createElement("div");
+      body.className = "entry-body";
+      body.textContent = e.text;
+      card.append(head, body);
+      box.appendChild(card);
+    });
+  }
+  $("search").addEventListener("input", renderHistory);
+  twoStep($("clear-all"), "Delete all", "Click again to delete all", function () {
+    store(HISTORY_KEY, []);
+    openIds = {};
+    renderHistory();
+    toast("History deleted");
+  });
+
+  // ---- tabs ----
+  function show(view) {
+    var live = view === "live";
+    $("live").classList.toggle("active", live);
+    $("history").classList.toggle("active", !live);
+    $("tab-live").setAttribute("aria-selected", String(live));
+    $("tab-history").setAttribute("aria-selected", String(!live));
+    if (live) { if (following) { textEl.scrollTop = textEl.scrollHeight; } }
+    else { renderHistory(); }
+  }
+  $("tab-live").addEventListener("click", function () { show("live"); });
+  $("tab-history").addEventListener("click", function () { show("history"); });
+})();
+</script>
+</body>
+</html>

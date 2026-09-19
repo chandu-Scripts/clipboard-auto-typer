@@ -15,6 +15,7 @@ Copy text anywhere — an AI response, a document, dictated text — and it appe
   - In laptop-to-laptop setups, the same hotkey works from **either** laptop: pressed on the Sends laptop, it sends a pause/resume command to the Types laptop's typing job instead of doing nothing locally — so you don't need to walk over to the other machine.
 - **Reliable by construction**: text is written directly into the Word document via Word's COM automation (`Document.Content.InsertAfter`) rather than simulated keystrokes, so it can't drop or corrupt characters, and doesn't depend on which window happens to have focus at any given instant.
 - Auto-launches Word with your chosen document if it isn't already open.
+- **Answer Board (optional web page)**: set **Output** to **Web page** or **Both** and the same typed text also streams live into a page in your browser — text size and font controls, fullscreen, Copy, Save, Clear, and a searchable History. See [Answer Board](#answer-board) below.
 - **Laptop-to-laptop**: copy on one Windows laptop and it types into Word on a second one, over the internet or a shared local network, within a second or two, at the receiving laptop's speed slider — see [Laptop-to-Laptop](#laptop-to-laptop) below.
 - **Mode switch**: each install of the app is either **Types** (writes to a local Word document) or **Sends** (relays its clipboard to another laptop in Types mode) — only the controls relevant to that role are shown, and a status line shows whether the relay connection is actually alive.
 - **Remembers your setup**: mode, connection type, Word document path, speed, font, and whether a toggle was on are all restored automatically on the next launch — no need to re-select everything every time you restart the app.
@@ -60,6 +61,25 @@ While it's typing, switch to another app freely — generation pauses immediatel
 ## How it works
 
 The app polls the clipboard for changes on a background thread. When new text is detected, it connects to (or launches) Word via [COM automation](https://learn.microsoft.com/en-us/office/vba/api/word.document) and appends the text word by word using `Document.Content.InsertAfter`, rather than simulating keystrokes — this is what makes typing reliable and focus-independent, while pause/resume is layered on top as a deliberate choice so the tool never interferes with input in whatever app you're actually using.
+
+## Answer Board
+
+The **Output** setting (Types mode) chooses where typed text goes:
+
+| Output | Where the text goes |
+|---|---|
+| **Word** (default) | The Word document, exactly as before |
+| **Web page** | The Answer Board only — no Word needed (so no document path is required either) |
+| **Both** | Word and the Answer Board at the same time |
+
+Click **Open Answer Board** (or browse to `http://localhost:8766/`). The page:
+
+- shows text as it is typed, following the newest text — scroll up to read earlier text and it stops following until you press **Jump to latest** or scroll back to the bottom;
+- mirrors the typing status (Typing · 12/71 words, Paused, Done, Stopped), including pause/resume;
+- has text size (A− / A+), a font picker, **Fullscreen**, **Copy**, **Save to history**, and **Clear** (asks twice);
+- keeps a **History** tab of saved answers with search — stored in your browser only.
+
+It is served from the same laptop that is typing, on `127.0.0.1` only, so other devices on the network cannot open it. With **Both**, the pause-when-you-leave-Word behaviour also treats the Answer Board's browser window as "focused", so watching the board doesn't pause typing. With **Web page** alone there is no Word window to watch, so only the Pause button, hotkey, and Stop apply.
 
 ## Laptop-to-Laptop
 

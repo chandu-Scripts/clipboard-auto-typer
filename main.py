@@ -1,6 +1,7 @@
 import http.server
 import json
 import os
+import queue
 import re
 import socket
 import socketserver
@@ -9,6 +10,7 @@ import threading
 import time
 import tkinter as tk
 import traceback
+import webbrowser
 from tkinter import filedialog
 
 import keyboard
@@ -27,14 +29,15 @@ CLIPBOARD_POLL_SECONDS = 0.15
 
 # Inserted between an old (possibly interrupted, mid-sentence) entry and a
 # newly started one, since entries are no longer cleared - a full dashed
-# line plus a blank line makes the cutoff point visually obvious rather
-# than just a plain blank line.
+# line makes the cutoff point visually obvious rather than just a plain
+# blank line.
 ENTRY_SEPARATOR = "\n" + "-" * 40 + "\n"
-# Avoid letters (ctrl+<letter> can leak through as a real shortcut on a
-# mistimed press - ctrl+alt+p briefly looking like ctrl+p = Print was exactly
-# that) and avoid F10 (Windows treats it as a special system key that can
-# activate a window's menu bar on its own, which is what opened a new
-# untitled file via File > New). Insert has neither problem.
+# Chosen by the user (ctrl+alt+p). Known trade-off: a letter key can leak
+# through as a real shortcut on a mistimed press - ctrl+alt+p briefly
+# looking like ctrl+p = Print happened once, which is why this used to be
+# ctrl+alt+insert. Avoid F10 (Windows treats it as a special system key that
+# can activate a window's menu bar on its own, which is what opened a new
+# untitled file via File > New).
 PAUSE_HOTKEY = "ctrl+alt+p"
 HOTKEY_DEBOUNCE_SECONDS = 0.5
 
@@ -114,6 +117,17 @@ HEARTBEAT_TIMEOUT_SECONDS = 12
 # message quota. Both sides must agree on this port (stored in
 # remote_config.json as "lan_port", defaulting here if absent).
 LAN_DEFAULT_PORT = 8765
+
+# The "Answer Board" web page: a text view served from this laptop to a
+# browser on this same laptop (bound to 127.0.0.1 only, so nothing else on
+# the network can reach it - unlike the LAN listener above). board.html sits
+# next to main.py and is read fresh on each page load.
+BOARD_PORT = 8766
+BOARD_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "board.html")
+BOARD_URL = f"http://localhost:{BOARD_PORT}/"
+BOARD_WINDOW_TITLE = "Answer Board"  # must match <title> in board.html
+BOARD_MAX_CHARS = 2_000_000
+BOARD_KEEPALIVE_SECONDS = 15
 
 TOKEN_PATTERN = re.compile(r"\S+|\s+")
 
@@ -406,6 +420,193 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
         pass  # suppress BaseHTTPRequestHandler's default per-request stderr logging
 
 
+class BoardHub:
+    """Holds the Answer Board's current text and fans every change out to
+    each connected browser page. Thread-safe: the typing thread appends,
+    HTTP handler threads subscribe/clear, and the Tk thread reads state."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._text = ""
+        self._status = {"state": "idle", "done": 0, "total": 0}
+        self._subscribers = []
+
+    def has_text(self):
+        with self._lock:
+            return bool(self._text.strip())
+
+    def append(self, chunk):
+        if not chunk:
+            return
+        with self._lock:
+            self._text += chunk
+            if len(self._text) > BOARD_MAX_CHARS:
+                self._text = self._text[-BOARD_MAX_CHARS:]
+                # Pages hold the untrimmed text - resync them all instead
+                # of sending a chunk they'd append to the wrong base.
+                self._broadcast_locked("snapshot", self._snapshot_locked())
+                return
+            self._broadcast_locked("append", chunk)
+
+    def clear(self):
+        with self._lock:
+            self._text = ""
+            self._broadcast_locked("clear", None)
+
+    def set_status(self, state, done=None, total=None):
+        with self._lock:
+            self._status["state"] = state
+            if done is not None:
+                self._status["done"] = done
+            if total is not None:
+                self._status["total"] = total
+            self._broadcast_locked("status", dict(self._status))
+
+    def subscribe(self):
+        """Returns (queue, snapshot) atomically, so a page never misses or
+        double-applies an event between its snapshot and its live stream."""
+        q = queue.Queue(maxsize=5000)
+        with self._lock:
+            self._subscribers.append(q)
+            return q, self._snapshot_locked()
+
+    def unsubscribe(self, q):
+        with self._lock:
+            if q in self._subscribers:
+                self._subscribers.remove(q)
+
+    def is_subscribed(self, q):
+        with self._lock:
+            return q in self._subscribers
+
+    def _snapshot_locked(self):
+        return {"text": self._text, "status": dict(self._status)}
+
+    def _broadcast_locked(self, event, data):
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait((event, data))
+            except queue.Full:
+                # A stuck page must not block typing - drop it. Its stream
+                # notices it's no longer subscribed and ends, and the
+                # browser reconnects with a fresh snapshot.
+                self._subscribers.remove(q)
+
+
+class BoardServer(LANServer):
+    """Serves the Answer Board page and its live text stream on 127.0.0.1
+    only. Expects `hub` (a BoardHub) to be set by the creator."""
+
+    daemon_threads = True  # open pages must not keep the app alive at exit
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hub = None
+        self.stopping = threading.Event()
+
+    def handle_error(self, request, client_address):
+        # A browser tab closing mid-stream is normal, not worth a crash.log entry.
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
+class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
+    def _host_ok(self):
+        # Rejects requests whose Host header isn't this loopback address -
+        # stops another website from reading the board through DNS
+        # rebinding, even though the server only listens on 127.0.0.1.
+        port = self.server.server_address[1]
+        host = (self.headers.get("Host") or "").lower()
+        return host in (f"localhost:{port}", f"127.0.0.1:{port}")
+
+    def _reply(self, code, body=b"", content_type="text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        if not self._host_ok():
+            self._reply(403, b"Forbidden")
+            return
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/board", "/index.html"):
+            try:
+                with open(BOARD_HTML_PATH, "rb") as f:
+                    body = f.read()
+            except OSError:
+                self._reply(500, b"board.html not found next to main.py")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; "
+                "style-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'",
+            )
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/stream":
+            self._stream()
+        elif path == "/favicon.ico":
+            self._reply(204)
+        else:
+            self._reply(404, b"Not found")
+
+    def do_POST(self):
+        if not self._host_ok():
+            self._reply(403, b"Forbidden")
+            return
+        path = self.path.split("?", 1)[0]
+        # A custom header makes this a non-simple request, which a browser
+        # won't let another website send cross-origin.
+        if path == "/clear" and self.headers.get("X-Board") == "1":
+            self.server.hub.clear()
+            self._reply(204)
+        else:
+            self._reply(404, b"Not found")
+
+    def _send_event(self, event, data):
+        payload = json.dumps(data)  # one line: json escapes newlines
+        self.wfile.write(f"event: {event}\ndata: {payload}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def _stream(self):
+        hub = self.server.hub
+        q, snapshot = hub.subscribe()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self._send_event("snapshot", snapshot)
+            while True:
+                try:
+                    event, data = q.get(timeout=BOARD_KEEPALIVE_SECONDS)
+                except queue.Empty:
+                    if self.server.stopping.is_set() or not hub.is_subscribed(q):
+                        return
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                self._send_event(event, data)
+        except OSError:
+            pass  # page closed or navigated away
+        finally:
+            hub.unsubscribe(q)
+
+    def log_message(self, format, *args):
+        pass
+
+
 class AutoTyper:
     """Writes tokenized text into a Word document via COM automation
     (Document.Content.InsertAfter), in word batches paced to approximate
@@ -429,12 +630,20 @@ class AutoTyper:
         self.stop_flag = threading.Event()
         self.thread = None
 
-    def start(self, tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator):
+    def start(
+        self, tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator,
+        board=None, board_needs_separator=False,
+    ):
+        """file_path=None means no Word output (web-board only); board=None
+        means no board output. At least one of the two should be given."""
         self.stop_flag.clear()
         self.running_event.set()
         self.thread = threading.Thread(
             target=self._run,
-            args=(tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator),
+            args=(
+                tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator,
+                board, board_needs_separator,
+            ),
             daemon=True,
         )
         self.thread.start()
@@ -457,17 +666,31 @@ class AutoTyper:
     def is_running(self):
         return bool(self.thread and self.thread.is_alive())
 
-    def _run(self, tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator):
+    def _run(
+        self, tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator,
+        board=None, board_needs_separator=False,
+    ):
         # COM objects have thread affinity (the STA apartment model) -
         # every thread that touches Word must initialize COM itself, the
         # same per-thread requirement UI Automation had for Notepad.
         pythoncom.CoInitialize()
+        completed = False
         try:
-            self._run_inner(tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator)
+            completed = bool(
+                self._run_inner(
+                    tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator,
+                    board, board_needs_separator,
+                )
+            )
         finally:
+            if board is not None:
+                board.set_status("done" if completed else "stopped")
             pythoncom.CoUninitialize()
 
-    def _run_inner(self, tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator):
+    def _run_inner(
+        self, tokens, wpm, on_status, on_progress, on_done, file_path, font_name, font_size, needs_separator,
+        board=None, board_needs_separator=False,
+    ):
         seconds_per_word = 60.0 / wpm
         # Enough words per call to roughly keep pace with the requested
         # WPM without calling more often than WORD_CALL_INTERVAL_SECONDS
@@ -476,23 +699,32 @@ class AutoTyper:
         words_per_batch = max(1, round(WORD_CALL_INTERVAL_SECONDS / seconds_per_word))
         total_words = sum(1 for is_word, _ in tokens if is_word)
 
-        doc = get_word_document(file_path)
-        if doc is None:
-            on_status("Could not open the Word document.")
-            return
-        apply_word_font(doc, font_name, font_size)
-        try:
-            target_hwnd = doc.ActiveWindow.Hwnd
-        except Exception:
-            on_status("Could not find the Word window.")
-            return
-
-        if needs_separator:
-            try:
-                doc.Content.InsertAfter(ENTRY_SEPARATOR)
-            except Exception as exc:
-                on_status(f"Could not write to Word: {exc}")
+        use_word = file_path is not None
+        doc = None
+        target_hwnd = None
+        if use_word:
+            doc = get_word_document(file_path)
+            if doc is None:
+                on_status("Could not open the Word document.")
                 return
+            apply_word_font(doc, font_name, font_size)
+            try:
+                target_hwnd = doc.ActiveWindow.Hwnd
+            except Exception:
+                on_status("Could not find the Word window.")
+                return
+
+            if needs_separator:
+                try:
+                    doc.Content.InsertAfter(ENTRY_SEPARATOR)
+                except Exception as exc:
+                    on_status(f"Could not write to Word: {exc}")
+                    return
+
+        if board is not None:
+            if board_needs_separator:
+                board.append(ENTRY_SEPARATOR)
+            board.set_status("typing", 0, total_words)
 
         # Unlike the old Notepad version, which had to re-send the WHOLE
         # document on every flush (SetValue() replaces content rather
@@ -504,21 +736,26 @@ class AutoTyper:
         words_since_flush = 0
 
         def flush():
-            if not win32gui.IsWindow(target_hwnd):
-                on_status("Word window closed - stopped.")
-                return False
-            try:
-                doc.Content.InsertAfter("".join(pending_chunks))
-                scroll_word_to_end(doc)
-            except Exception as exc:
-                on_status(f"Could not write to Word: {exc}")
-                return False
+            text = "".join(pending_chunks)
+            if use_word:
+                if not win32gui.IsWindow(target_hwnd):
+                    on_status("Word window closed - stopped.")
+                    return False
+                try:
+                    doc.Content.InsertAfter(text)
+                    scroll_word_to_end(doc)
+                except Exception as exc:
+                    on_status(f"Could not write to Word: {exc}")
+                    return False
+            if board is not None:
+                board.append(text)
+                board.set_status("typing", done_words, total_words)
             pending_chunks.clear()
             on_progress(done_words, total_words)
             return True
 
         for is_word, chunk in tokens:
-            if not self._wait_until_ready(target_hwnd, on_status):
+            if not self._wait_until_ready(target_hwnd, on_status, board):
                 return  # stopped, or window closed - status already set
 
             pending_chunks.append(chunk)
@@ -547,12 +784,13 @@ class AutoTyper:
         if pending_chunks:
             if not flush():  # final flush for any remaining tail (last partial batch, trailing whitespace)
                 return
-        else:
+        elif use_word:
             scroll_word_to_end(doc)  # nothing left to flush, but make sure the view is fully caught up
         on_status("Done")
         on_done()
+        return True
 
-    def _wait_until_ready(self, target_hwnd, on_status):
+    def _wait_until_ready(self, target_hwnd, on_status, board=None):
         """Blocks until not manually paused AND Word has OS focus, so
         switching away pauses generation immediately (nothing more gets
         written) and switching back resumes it exactly where it left off -
@@ -563,24 +801,39 @@ class AutoTyper:
         individual keystrokes, there's no risk of a corrupted partial word
         from pausing here, so this doesn't need to be any finer-grained
         than that. Returns False (with on_status already set) if stop()
-        was called or the target window has been closed."""
+        was called or the target window has been closed.
+
+        target_hwnd=None (web-board-only output) has no Word window to
+        watch, so only the manual pause and stop apply. With Word AND the
+        board, a foreground window titled "Answer Board" also counts as
+        focused - otherwise watching the board in a browser would leave
+        Word unfocused and pause the very output being watched."""
         announced = False
         while True:
+            if board is not None and not self.running_event.is_set():
+                board.set_status("paused")  # manual pause - the board page mirrors it
             self.running_event.wait()
             if self.stop_flag.is_set():
                 on_status("Stopped")
                 return False
+            if target_hwnd is None:
+                return True
             if not win32gui.IsWindow(target_hwnd):
                 on_status("Word window closed - stopped.")
                 return False
             try:
-                has_focus = win32gui.GetForegroundWindow() == target_hwnd
+                foreground = win32gui.GetForegroundWindow()
+                has_focus = foreground == target_hwnd or (
+                    board is not None and BOARD_WINDOW_TITLE in win32gui.GetWindowText(foreground)
+                )
             except Exception:
                 has_focus = True  # can't tell - don't get stuck waiting forever
             if has_focus:
                 return True
             if not announced:
                 on_status("Paused - switch back to Word to resume typing.")
+                if board is not None:
+                    board.set_status("paused")
                 announced = True
             time.sleep(0.15)
 
@@ -636,7 +889,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Clipboard Auto Typer")
-        root.geometry("560x300")
+        root.geometry("600x400")
 
         # This laptop plays one of two roles at a time - "type" (types
         # copied/relayed text into a local Word document) or "send" (relays
@@ -684,6 +937,19 @@ class App:
         self.file_path_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
         self.browse_btn = tk.Button(path_frame, text="Browse...", command=self.browse_file)
         self.browse_btn.pack(side="left")
+
+        output_frame = tk.Frame(self.type_container)
+        output_frame.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(output_frame, text="Output:").pack(side="left")
+        self.output_var = tk.StringVar(value="word")
+        for label, value in (("Word", "word"), ("Web page", "web"), ("Both", "both")):
+            tk.Radiobutton(
+                output_frame, text=label, variable=self.output_var, value=value, command=self.on_output_change
+            ).pack(side="left", padx=(6, 0))
+        self.open_board_btn = tk.Button(
+            output_frame, text="Open Answer Board", command=self.open_board, state="disabled"
+        )
+        self.open_board_btn.pack(side="left", padx=(12, 0))
 
         font_frame = tk.Frame(self.type_container)
         font_frame.pack(fill="x", padx=10, pady=(0, 6))
@@ -761,6 +1027,10 @@ class App:
 
         self.typer = AutoTyper()
         self.paused = False
+        self.board = BoardHub()
+        self.board_server = None
+        self.board_stop_thread = None
+        self.board_lock = threading.Lock()
 
         self.clipboard_watch_enabled = False
         self.last_clipboard_text = ""
@@ -885,6 +1155,10 @@ class App:
         font_size = settings.get("font_size")
         if isinstance(font_size, int) and 6 <= font_size <= 96:
             self.font_size_var.set(font_size)
+        output = settings.get("output")
+        if output in ("word", "web", "both"):
+            self.output_var.set(output)
+            self.on_output_change()
 
         # Same handlers a user clicking the radio buttons would trigger -
         # syncs container visibility etc. Safe to call here since nothing
@@ -918,6 +1192,7 @@ class App:
                     "wpm": self.wpm_var.get(),
                     "font_name": self.font_name_var.get(),
                     "font_size": self.font_size_var.get(),
+                    "output": self.output_var.get(),
                     "remote_watch_enabled": self.remote_watch_enabled,
                     "send_clipboard_remote_enabled": self.send_clipboard_remote_enabled,
                 }
@@ -1184,30 +1459,42 @@ class App:
         if not any(is_word for is_word, _ in tokens):
             return True  # nothing to type, but not a failure - don't retry it
 
+        output = self.output_var.get()
+        use_word = output in ("word", "both")
+        use_board = output in ("web", "both")
+
         file_path = self.file_path_var.get().strip()
-        if not file_path:
+        if use_word and not file_path:
             self.on_status("Set a Word document path first, then copy again.")
             return False
 
         self.typer.stop_and_wait()
 
-        if not self.ensure_word_open(file_path):
-            return False
+        needs_separator = False
+        if use_word:
+            if not self.ensure_word_open(file_path):
+                return False
 
-        doc = get_word_document(file_path)
-        if doc is None:
-            self.on_status("Could not open the Word document - will retry.")
-            return False
-        try:
-            needs_separator = bool(doc.Content.Text.strip())
-        except Exception as exc:
-            self.on_status(f"Could not read the Word document's current text: {exc} - will retry.")
-            return False
+            doc = get_word_document(file_path)
+            if doc is None:
+                self.on_status("Could not open the Word document - will retry.")
+                return False
+            try:
+                needs_separator = bool(doc.Content.Text.strip())
+            except Exception as exc:
+                self.on_status(f"Could not read the Word document's current text: {exc} - will retry.")
+                return False
 
-        try:
-            force_foreground(self.word_hwnd)
-        except Exception:
-            pass  # best-effort only - typing doesn't depend on this succeeding
+            try:
+                force_foreground(self.word_hwnd)
+            except Exception:
+                pass  # best-effort only - typing doesn't depend on this succeeding
+
+        board_needs_separator = False
+        if use_board:
+            if not self.start_board_server():
+                return False
+            board_needs_separator = self.board.has_text()
 
         self.root.after(0, self.set_controls_running)
         self.typer.start(
@@ -1216,12 +1503,65 @@ class App:
             self.on_status,
             self.on_progress,
             self.on_done_auto,
-            file_path,
+            file_path if use_word else None,
             self.font_name_var.get().strip() or WORD_DEFAULT_FONT_NAME,
             self.font_size_var.get(),
             needs_separator,
+            board=self.board if use_board else None,
+            board_needs_separator=board_needs_separator,
         )
         return True
+
+    # ---- Answer Board (local web page output) ----
+
+    def start_board_server(self):
+        """Starts the localhost-only Answer Board server if it isn't
+        already running. Safe to call from any thread (the typing paths
+        call it from background threads, the Output setting from Tk)."""
+        with self.board_lock:
+            if self.board_server is not None:
+                return True
+            stopping = self.board_stop_thread
+            if stopping is not None:
+                stopping.join(timeout=3)  # a just-stopped server still holds the port until it finishes closing
+            try:
+                server = BoardServer(("127.0.0.1", BOARD_PORT), BoardRequestHandler)
+            except OSError as exc:
+                self.on_status(f"Could not start the Answer Board on port {BOARD_PORT}: {exc}")
+                return False
+            server.hub = self.board
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.board_server = server
+            return True
+
+    def stop_board_server(self):
+        with self.board_lock:
+            server, self.board_server = self.board_server, None
+            if server is None:
+                return
+            server.stopping.set()  # ends any open page streams at their next keepalive
+            # shutdown() waits for serve_forever() to exit, so it can't run
+            # on the thread that would be blocked by it. start_board_server
+            # waits on this thread before rebinding the port.
+            self.board_stop_thread = threading.Thread(
+                target=lambda: (server.shutdown(), server.server_close()), daemon=True
+            )
+            self.board_stop_thread.start()
+
+    def on_output_change(self):
+        if self.output_var.get() in ("web", "both"):
+            if self.start_board_server():
+                self.open_board_btn.config(state="normal")
+                self.status_label.config(text=f"Answer Board ready: {BOARD_URL}")
+            else:
+                self.output_var.set("word")
+                self.open_board_btn.config(state="disabled")
+        else:
+            self.stop_board_server()
+            self.open_board_btn.config(state="disabled")
+
+    def open_board(self):
+        webbrowser.open(BOARD_URL)
 
     # ---- web remote trigger flow ----
 
@@ -1233,9 +1573,13 @@ class App:
             self.stop_remote_watch()
             self.status_label.config(text="Remote trigger stopped.")
             return
+        output = self.output_var.get()
+        use_word = output in ("word", "both")
         file_path = self.file_path_var.get().strip()
-        if not file_path:
+        if use_word and not file_path:
             self.status_label.config(text="Select a Word document path first.")
+            return
+        if output in ("web", "both") and not self.start_board_server():
             return
         if self.connection_type_var.get() == "lan":
             port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)
@@ -1258,7 +1602,10 @@ class App:
         # actually been seen.
         self.type_last_peer_heartbeat = 0.0
         self.remote_btn.config(text="Disable Web Remote Trigger")
-        threading.Thread(target=self.prelaunch_word, args=(file_path,), daemon=True).start()
+        if use_word:
+            threading.Thread(target=self.prelaunch_word, args=(file_path,), daemon=True).start()
+        else:
+            self.status_label.config(text=f"Waiting for answers - Answer Board: {BOARD_URL}")
 
     def remote_watch_loop(self):
         # Same reason as clipboard_watch_loop/AutoTyper._run - this thread

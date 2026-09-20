@@ -52,8 +52,10 @@
     background: var(--panel);
     border-bottom: 1px solid var(--line);
   }
+  .brand-block { line-height: 1.15; }
   .brand { font-weight: 700; font-size: 16px; letter-spacing: .02em; }
   .brand span { color: var(--accent); }
+  .byline { font-size: 11px; color: var(--muted); letter-spacing: .03em; }
   nav { display: flex; gap: 4px; margin-left: 8px; }
   .tab {
     background: none; border: 0; border-radius: 8px; padding: 6px 12px; color: var(--muted);
@@ -89,11 +91,16 @@
   .size { min-width: 52px; text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
   select { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
 
-  #mic { display: inline-flex; align-items: center; gap: 8px; }
-  #mic .dot { background: var(--muted); }
-  #mic.live { border-color: var(--bad); }
-  #mic.live .dot { background: var(--bad); animation: pulse 1.1s ease-in-out infinite; }
-  @media (prefers-reduced-motion: reduce) { #mic.live .dot { animation: none; } }
+  /* Off = red mic with a cross; on (really listening) = green mic. */
+  #mic { padding: 6px 9px; display: inline-flex; align-items: center; color: var(--bad); }
+  #mic svg { display: block; fill: currentColor; }
+  #mic .slash-bg { stroke: var(--panel-2); stroke-width: 4; stroke-linecap: round; }
+  #mic .slash { stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+  #mic.live { color: var(--ok); border-color: var(--ok); animation: micglow 1.6s ease-in-out infinite; }
+  #mic.live .slash-bg, #mic.live .slash { display: none; }
+  @keyframes micglow { 50% { box-shadow: 0 0 0 4px rgba(92,192,138,.25); } }
+  @media (prefers-reduced-motion: reduce) { #mic.live { animation: none; } }
+  .mic-note { color: var(--muted); font-size: 12px; margin-left: 4px; }
   #interim { color: var(--muted); font-style: italic; }
 
   .reader { position: relative; min-height: 0; }
@@ -103,11 +110,6 @@
     white-space: pre-wrap; overflow-wrap: anywhere;
     line-height: 1.55;
   }
-  #empty {
-    position: absolute; inset: 0; display: grid; place-content: center; text-align: center;
-    color: var(--muted); pointer-events: none; padding: 24px;
-  }
-  #empty strong { display: block; font-size: 18px; color: var(--text); margin-bottom: 6px; }
   #jump {
     position: absolute; right: 22px; bottom: 18px; display: none;
     box-shadow: 0 6px 20px rgba(0,0,0,.4);
@@ -136,7 +138,10 @@
 </head>
 <body>
 <header>
-  <div class="brand">Answer<span>Board</span></div>
+  <div class="brand-block">
+    <div class="brand">Answer<span>Board</span></div>
+    <div class="byline">By Chandu</div>
+  </div>
   <nav role="tablist" aria-label="Views">
     <button class="tab" role="tab" id="tab-live" aria-selected="true" aria-controls="live">Live</button>
     <button class="tab" role="tab" id="tab-history" aria-selected="false" aria-controls="history">History</button>
@@ -157,8 +162,15 @@
       <select id="font" aria-label="Font"></select>
       <button id="fullscreen">Fullscreen</button>
       <span class="group">
-        <button id="mic" aria-pressed="false" title="Speak to add text to the board"><span class="dot"></span><span id="mic-text">Start listening</span></button>
+        <button id="mic" aria-pressed="false" aria-label="Microphone off - click to turn on" title="Microphone off - click to turn on">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/>
+            <line class="slash-bg" x1="4" y1="4" x2="20" y2="20"/>
+            <line class="slash" x1="4" y1="4" x2="20" y2="20"/>
+          </svg>
+        </button>
         <select id="lang" aria-label="Speech language"></select>
+        <span id="mic-note" class="mic-note" role="status" aria-live="polite"></span>
       </span>
       <span class="spacer"></span>
       <button id="copy">Copy</button>
@@ -167,7 +179,6 @@
     </div>
     <div class="reader">
       <div id="text" tabindex="0" aria-label="Answers"></div>
-      <div id="empty"><div><strong>Waiting for answers</strong>Text sent from the app appears here as it is typed, or press “Start listening” to speak.</div></div>
       <button id="jump" class="primary">Jump to latest ↓</button>
     </div>
   </section>
@@ -232,10 +243,6 @@
   var following = true;
   var scrollQueued = false;
 
-  function updateEmpty() {
-    var has = textNode.data.length > 0 || interimEl.textContent.length > 0;
-    $("empty").style.display = has ? "none" : "grid";
-  }
   function atBottom() {
     return textEl.scrollHeight - textEl.scrollTop - textEl.clientHeight <= 48;
   }
@@ -316,24 +323,20 @@
     var d = JSON.parse(e.data);
     textNode.data = d.text;
     setStatus(d.status);
-    updateEmpty();
     if (following) followIfNeeded();
     updateJump();
   });
   source.addEventListener("append", function (e) {
     textNode.appendData(JSON.parse(e.data));
-    updateEmpty();
     followIfNeeded();
     updateJump();
   });
   source.addEventListener("clear", function () {
     textNode.data = "";
     following = true;
-    updateEmpty();
     updateJump();
   });
   source.addEventListener("status", function (e) { setStatus(JSON.parse(e.data)); });
-  updateEmpty();
 
   // ---- speech: the browser's built-in recognizer, finished phrases go to the app ----
   var LANGS = [
@@ -355,10 +358,13 @@
   });
 
   var micBtn = $("mic");
+  var micNote = $("mic-note");
   var recog = null;
   var listening = false;       // what the user asked for; the browser may stop on its own
-  var quickEnds = 0;           // recognizer ended almost immediately, repeatedly
+  var retryDelay = 250;        // grows while restarts keep failing, resets after a healthy session
+  var retryTimer = null;
   var lastStart = 0;
+  var lastError = "";
 
   // Looked up when used, not at load, so it can be swapped for a test double.
   function getRecognizer() { return window.SpeechRecognition || window.webkitSpeechRecognition; }
@@ -369,13 +375,15 @@
     // don't jump when they turn into real text.
     var needsSpace = t && textNode.data && !/\s$/.test(textNode.data);
     interimEl.textContent = t ? (needsSpace ? " " : "") + t : "";
-    updateEmpty();
     followIfNeeded();
   }
+  function setMicNote(text) { micNote.textContent = text || ""; }
   function updateMic() {
+    var label = listening ? "Microphone on - click to turn off" : "Microphone off - click to turn on";
     micBtn.classList.toggle("live", listening);
     micBtn.setAttribute("aria-pressed", String(listening));
-    $("mic-text").textContent = listening ? "Stop listening" : "Start listening";
+    micBtn.setAttribute("aria-label", label);
+    micBtn.title = label;
   }
   function sendPhrase(text) {
     text = text.trim();
@@ -390,11 +398,28 @@
   }
   function stopListening(message) {
     listening = false;
+    clearTimeout(retryTimer);
     if (recog) { try { recog.abort(); } catch (e) { /* already stopped */ } }
     recog = null;
     setInterim("");
+    setMicNote("");
     updateMic();
     if (message) toast(message);
+  }
+  // Listening stays on until the user turns it off. Only these mean it
+  // truly can't continue; everything else (silence, a dropped connection, the
+  // browser ending a long session) is retried, backing off up to 5 seconds.
+  var FATAL = {
+    "not-allowed": "Microphone is blocked - allow it in the address bar, then turn it on again",
+    "service-not-allowed": "Speech recognition is blocked in this browser",
+    "audio-capture": "No microphone found",
+    "language-not-supported": "This language isn't supported by the browser's speech service"
+  };
+  function scheduleRestart(mine) {
+    var delay = retryDelay;
+    retryDelay = Math.min(retryDelay * 2, 5000);
+    clearTimeout(retryTimer);
+    retryTimer = setTimeout(function () { if (listening && mine === recog) startRecognizer(); }, delay);
   }
   function startRecognizer() {
     var Rec = getRecognizer();
@@ -404,6 +429,9 @@
     recog.interimResults = true;
     var mine = recog;
     recog.onresult = function (e) {
+      if (mine !== recog) return;
+      retryDelay = 250;
+      setMicNote("");
       var interim = "";
       for (var i = e.resultIndex; i < e.results.length; i++) {
         var r = e.results[i];
@@ -412,30 +440,32 @@
       setInterim(interim);
     };
     recog.onerror = function (e) {
-      if (e.error === "no-speech" || e.error === "aborted") return;
-      var reasons = {
-        "not-allowed": "Microphone is blocked - allow it in the address bar, then try again",
-        "service-not-allowed": "Speech recognition is blocked in this browser",
-        "audio-capture": "No microphone found",
-        "network": "Speech service unreachable - it needs an internet connection"
-      };
-      if (mine === recog) stopListening(reasons[e.error] || "Speech error: " + e.error);
+      if (mine !== recog) return;
+      if (FATAL[e.error]) { stopListening(FATAL[e.error]); return; }
+      lastError = e.error;              // soft: onend follows and restarts
     };
     recog.onend = function () {
       if (mine !== recog) return;       // replaced or stopped on purpose
       setInterim("");
       if (!listening) return;
-      // The browser ends a session after a stretch of silence; carry on.
-      quickEnds = (Date.now() - lastStart < 1000) ? quickEnds + 1 : 0;
-      if (quickEnds >= 3) { stopListening("Listening keeps stopping - check your microphone"); return; }
-      setTimeout(function () { if (listening && mine === recog) startRecognizer(); }, 250);
+      if (Date.now() - lastStart >= 2000 && lastError !== "network") {
+        retryDelay = 250;               // a normal end (silence timeout): carry straight on
+        setMicNote("");
+      } else {
+        setMicNote(lastError === "network" ? "No connection - retrying…" : "Reconnecting…");
+      }
+      lastError = "";
+      scheduleRestart(mine);
     };
     lastStart = Date.now();
-    try { recog.start(); } catch (e) { stopListening("Could not start listening"); }
+    try { recog.start(); } catch (e) { scheduleRestart(mine); }
   }
   function restartRecognizer() {
     var old = recog;
     recog = null;
+    clearTimeout(retryTimer);
+    retryDelay = 250;
+    setMicNote("");
     if (old) { try { old.abort(); } catch (e) { /* already stopped */ } }
     startRecognizer();
   }
@@ -443,7 +473,7 @@
     if (listening) { stopListening(); return; }
     if (!getRecognizer()) { toast("Speech needs Chrome or Edge"); return; }
     listening = true;
-    quickEnds = 0;
+    retryDelay = 250;
     updateMic();
     startRecognizer();
   });

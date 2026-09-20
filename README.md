@@ -78,11 +78,12 @@ Click **Open Answer Board** (or browse to `http://localhost:8766/`). The page:
 - mirrors the typing status (Typing · 12/71 words, Paused, Done, Stopped), including pause/resume;
 - has text size (A− / A+), a font picker, **Fullscreen**, **Copy**, **Save to history**, and **Clear** (one click);
 - keeps a **History** tab of saved answers with search — stored in your browser only;
-- has a **Start listening** button and a language picker: speak, and your words show in grey while you talk, then become normal text on the board (see below).
+- has a **microphone icon** and a language picker: click the icon (red with a cross = off, green = listening), speak, and your words show in grey while you talk, then become normal text on the board (see below);
+- shows a blank board until text arrives, with a small "By Chandu" credit under the title.
 
 ### Speaking to the board
 
-Speech is recognised by your **browser's built-in recognizer**, so it works in Chrome and Edge only. Chrome and Edge send the audio to Google's or Microsoft's speech service, so it needs an internet connection — the Answer Board page itself is still only reachable from this laptop. The first time you press **Start listening**, the browser asks for microphone permission. Finished phrases are sent to the app and added to the board exactly like typed answers (they survive a page refresh, and Copy / Save / Clear / History all include them). Spoken text goes to the board only, never into Word.
+Speech is recognised by your **browser's built-in recognizer**, so it works in Chrome and Edge only. Chrome and Edge send the audio to Google's or Microsoft's speech service, so it needs an internet connection — the Answer Board page itself is still only reachable from this laptop. The first time you click the microphone icon, the browser asks for microphone permission. Once on, it stays on until you click the icon again: silences, a dropped connection, or the browser ending a long session are retried automatically (a small "Reconnecting…" note shows meanwhile). It only turns itself off for a real blocker — microphone permission denied, no microphone found, or an unsupported language — and says why. Finished phrases are sent to the app and added to the board exactly like typed answers (they survive a page refresh, and Copy / Save / Clear / History all include them). Spoken text goes to the board only, never into Word.
 
 It is served from the same laptop that is typing, on `127.0.0.1` only, so other devices on the network cannot open it. With **Both**, the pause-when-you-leave-Word behaviour also treats the Answer Board's browser window as "focused", so watching the board doesn't pause typing. With **Web page** alone there is no Word window to watch, so only the Pause button, hotkey, and Stop apply.
 

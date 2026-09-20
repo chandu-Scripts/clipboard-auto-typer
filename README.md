@@ -37,11 +37,17 @@ cd clipboard-auto-typer
 pip install -r requirements.txt
 ```
 
-## Usage
+## Starting the app
 
-```bash
-python main.py
-```
+Double-click **`start.bat`** in this folder. It starts the app with no console window and no need for VS Code. (If a required package is missing it says so and tells you to run `pip install -r requirements.txt` once.)
+
+- **Desktop shortcut:** right-click `start.bat` → *Show more options* → *Send to* → *Desktop (create shortcut)*.
+- **Start when you sign in to Windows:** press `Win+R`, type `shell:startup`, and put a shortcut to `start.bat` in the folder that opens. The app then starts in the system tray; it remembers its last settings.
+- Because there is no console, errors are written to `crash.log` instead.
+
+You can still run it from a terminal with `python main.py`.
+
+## Usage
 
 1. Choose (or browse to) the Word document you want text typed into.
 2. Set your preferred typing speed and font.

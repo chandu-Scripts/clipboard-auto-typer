@@ -79,7 +79,8 @@ Click **Open Answer Board** (or browse to `http://localhost:8766/`). The page:
 - has text size (A− / A+), a font picker, **Fullscreen**, **Copy**, **Save to history**, and **Clear** (one click);
 - keeps a **History** tab of saved answers with search — stored in your browser only;
 - has a **microphone icon** and a language picker: click the icon (red with a cross = off, green = listening), speak, and your words show in grey while you talk, then become normal text on the board (see below);
-- shows a blank board until text arrives, with a small "By Chandu" credit under the title.
+- shows a blank board until text arrives, with a small "By Chandu" credit under the title;
+- has a second, always-green microphone icon next to the **History** tab. It is **decoration only** — it never asks for the microphone, never records, and never converts anything to text (its hover text says "Decorative - not recording"). Only the microphone icon in the toolbar listens.
 
 ### Speaking to the board
 

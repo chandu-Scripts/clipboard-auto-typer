@@ -101,6 +101,14 @@
   @keyframes micglow { 50% { box-shadow: 0 0 0 4px rgba(92,192,138,.25); } }
   @media (prefers-reduced-motion: reduce) { #mic.live { animation: none; } }
   .mic-note { color: var(--muted); font-size: 12px; margin-left: 4px; }
+  /* The always-green display-only mic next to the tabs. Not a control. */
+  .mic-show {
+    display: inline-flex; align-items: center; margin-left: -6px; padding: 6px 9px;
+    color: var(--ok); border: 1px solid var(--ok); border-radius: 8px;
+    animation: micglow 1.6s ease-in-out infinite; cursor: default; user-select: none;
+  }
+  .mic-show svg { display: block; fill: currentColor; }
+  @media (prefers-reduced-motion: reduce) { .mic-show { animation: none; } }
   #interim { color: var(--muted); font-style: italic; }
 
   .reader { position: relative; min-height: 0; }
@@ -146,6 +154,12 @@
     <button class="tab" role="tab" id="tab-live" aria-selected="true" aria-controls="live">Live</button>
     <button class="tab" role="tab" id="tab-history" aria-selected="false" aria-controls="history">History</button>
   </nav>
+  <!-- Purely decorative: no script, no microphone access, never records or transcribes anything. -->
+  <span class="mic-show" id="mic-show" role="img" aria-label="Decorative - not recording" title="Decorative - not recording">
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/>
+    </svg>
+  </span>
   <div class="spacer"></div>
   <span class="link" id="link" title="Connection to the app"><span class="dot"></span><span id="link-text">Connecting…</span></span>
   <span class="pill" id="pill" data-state="idle" role="status" aria-live="polite"><span class="dot"></span><span id="pill-text">Idle</span></span>

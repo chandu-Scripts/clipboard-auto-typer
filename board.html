@@ -55,7 +55,9 @@
   .brand-block { line-height: 1.15; }
   .brand { font-weight: 700; font-size: 16px; letter-spacing: .02em; }
   .brand span { color: var(--accent); }
-  .byline { font-size: 11px; color: var(--muted); letter-spacing: .03em; }
+  .byline { font-size: 11px; letter-spacing: .03em; }
+  .byline .by { color: #ffffff; }
+  .byline .name { color: var(--accent); }
   nav { display: flex; gap: 4px; margin-left: 8px; }
   .tab {
     background: none; border: 0; border-radius: 8px; padding: 6px 12px; color: var(--muted);
@@ -148,7 +150,7 @@
 <header>
   <div class="brand-block">
     <div class="brand">Answer<span>Board</span></div>
-    <div class="byline">By Chandu</div>
+    <div class="byline"><span class="by">By</span> <span class="name">Chandu</span></div>
   </div>
   <nav role="tablist" aria-label="Views">
     <button class="tab" role="tab" id="tab-live" aria-selected="true" aria-controls="live">Live</button>

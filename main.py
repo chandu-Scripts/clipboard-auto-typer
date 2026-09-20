@@ -39,7 +39,15 @@ ENTRY_SEPARATOR = "\n" + "-" * 40 + "\n"
 # can activate a window's menu bar on its own, which is what opened a new
 # untitled file via File > New).
 PAUSE_HOTKEY = "ctrl+alt+p"
-HOTKEY_DEBOUNCE_SECONDS = 0.5
+# A held key produces a stream of auto-repeat presses ~30ms apart; a real tap
+# is an isolated press. Presses closer together than this are treated as part
+# of one held run and produce a single toggle (see App.on_pause_hotkey) -
+# unlike a fixed "ignore anything within 0.5s", quick deliberate taps each count.
+HOTKEY_RUN_WINDOW_SECONDS = 0.06
+# After the sender presses the hotkey, ignore state reports from the receiver
+# for this long: they were produced before the receiver saw the press, so they
+# describe the old state and would flip the sender's guess back.
+PAUSE_SYNC_QUIET_SECONDS = 4.0
 
 # Typing is done via Word's COM automation (Document.Content.InsertAfter),
 # not simulated keystrokes. Two independent problems with keyboard.write()/
@@ -393,13 +401,17 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
                 threading.Thread(target=self._start_typing, args=(app, text), daemon=True).start()
         elif kind in ("pause", "resume"):
             should_pause = kind == "pause"
-            # remote_set_paused() mirrors this same guard (no job running,
-            # or already in the requested state) and no-ops in either
-            # case - checked here too so the response doesn't optimistically
-            # report a state change that's not actually going to happen.
-            # is_running() reads Thread.is_alive(), which is safe to call
-            # from this (non-main) thread.
-            if app.typer.is_running() and should_pause != app.paused:
+            # Always handed to the Tk thread, which applies them in order;
+            # remote_set_paused() itself ignores a command that changes
+            # nothing. Deliberately NOT pre-filtered here against
+            # app.paused: that value only changes once the Tk thread runs
+            # the earlier command, so two commands arriving close together
+            # would be compared against stale state and the second dropped.
+            # Only skipped when no job is running (there is nothing to
+            # pause), so the response doesn't claim a change that won't
+            # happen. is_running() reads Thread.is_alive(), safe from this
+            # (non-main) thread.
+            if app.typer.is_running():
                 app.root.after(0, lambda sp=should_pause: app.remote_set_paused(sp))
                 reported_paused = should_pause
             # else: nothing will change - reported_paused stays app.paused
@@ -1117,7 +1129,17 @@ class App:
         self.lan_local_ip = None
         self.lan_last_request_time = 0.0
 
-        self.last_hotkey_time = 0.0
+        self.hotkey_lock = threading.Lock()
+        self.hotkey_last_event = 0.0
+        self.hotkey_seq = 0
+        # Sender side: presses are turned into "set the receiver to X"
+        # messages sent in order by one worker (see request_remote_pause).
+        self.pause_lock = threading.Lock()
+        self.pause_desired = False
+        self.pause_seq = 0
+        self.pause_sent_seq = 0
+        self.pause_worker_active = False
+        self.pause_last_press = 0.0
 
         threading.Thread(target=self.clipboard_watch_loop, daemon=True).start()
         threading.Thread(target=self.remote_watch_loop, daemon=True).start()
@@ -1307,10 +1329,29 @@ class App:
     # ---- pause/stop controls ----
 
     def on_pause_hotkey(self):
-        now = time.time()
-        if now - self.last_hotkey_time < HOTKEY_DEBOUNCE_SECONDS:
-            return  # ignore OS key-repeat firing this multiple times per press
-        self.last_hotkey_time = now
+        """Called for every hotkey press event, including the OS's
+        auto-repeat while the key is held. Each event waits a moment to see
+        whether another follows right behind it: a press followed within
+        HOTKEY_RUN_WINDOW_SECONDS by another, or that itself follows one
+        that closely, is auto-repeat and is dropped; an isolated press is a
+        real tap and acts. So a held key toggles once, while quick repeated
+        taps each toggle."""
+        with self.hotkey_lock:
+            now = time.time()
+            is_repeat = (now - self.hotkey_last_event) < HOTKEY_RUN_WINDOW_SECONDS
+            self.hotkey_last_event = now
+            self.hotkey_seq += 1
+            seq = self.hotkey_seq
+        timer = threading.Timer(HOTKEY_RUN_WINDOW_SECONDS, self._hotkey_settle, args=(seq, is_repeat))
+        timer.daemon = True
+        timer.start()
+
+    def _hotkey_settle(self, seq, is_repeat):
+        with self.hotkey_lock:
+            if seq != self.hotkey_seq:
+                return  # another press followed straight away: part of a held run
+        if is_repeat:
+            return  # the last press of a held run
         self.root.after(0, self.handle_pause_hotkey)
 
     def handle_pause_hotkey(self):
@@ -1334,17 +1375,50 @@ class App:
             if self.connection_type_var.get() == "lan" and not self.lan_receiver_ip_var.get().strip():
                 self.status_label.config(text="Enter the receiving laptop's LAN IP address first.")
                 return
-            # Optimistic - corrected by the next heartbeat/response if this
-            # guess turns out to be stale (e.g. the receiving laptop was
-            # also toggled locally since we last heard from it).
-            should_pause = not self.remote_typer_paused
-            self.remote_typer_paused = should_pause
-            threading.Thread(target=self.send_pause_resume_command, args=(should_pause,), daemon=True).start()
+            self.request_remote_pause()
+
+    def request_remote_pause(self):
+        """One hotkey press on the sender: flip our view of the receiver's
+        pause state (optimistic - corrected by later reports if the
+        receiver was also toggled locally) and make sure the receiver is
+        told. Sending is done by a single worker that always sends the
+        NEWEST wanted state, in order - so pressing quickly can never
+        deliver commands out of order or leave the receiver in a state the
+        last press didn't ask for."""
+        with self.pause_lock:
+            self.remote_typer_paused = not self.remote_typer_paused
+            self.pause_desired = self.remote_typer_paused
+            self.pause_seq += 1
+            self.pause_last_press = time.time()
+            if self.pause_worker_active:
+                return  # the running worker will pick up the newest state
+            self.pause_worker_active = True
+        threading.Thread(target=self._pause_worker, daemon=True).start()
+
+    def _pause_worker(self):
+        while True:
+            with self.pause_lock:
+                if self.pause_sent_seq == self.pause_seq:
+                    self.pause_worker_active = False
+                    return
+                desired, seq = self.pause_desired, self.pause_seq
+            resp = self.send_pause_resume_command(desired)
+            with self.pause_lock:
+                self.pause_sent_seq = seq
+                newest = seq == self.pause_seq
+            if newest and resp is not None:
+                # Nothing newer was pressed meanwhile, so the receiver's own
+                # answer is the truest picture of its state.
+                self.update_remote_paused_from_response(resp, authoritative=True)
 
     def send_pause_resume_command(self, should_pause):
+        """Sends one pause/resume message. Returns the HTTP response over
+        LAN (its body carries the receiver's real state), or None over
+        Internet Relay (fire-and-forget) or on failure."""
         secret = self.remote_config["secret"]
         kind = "pause" if should_pause else "resume"
         payload = json.dumps({"secret": secret, "kind": kind})
+        resp = None
         try:
             if self.connection_type_var.get() == "lan":
                 ip = self.lan_receiver_ip_var.get().strip()
@@ -1352,7 +1426,6 @@ class App:
                 resp = requests.post(
                     f"http://{ip}:{port}/", data=payload, headers={"Content-Type": "text/plain"}, timeout=10
                 )
-                self.update_remote_paused_from_response(resp)
             else:
                 topic = self.remote_config["topic"]
                 requests.post(
@@ -1365,16 +1438,31 @@ class App:
             self.on_status(f"Sent {kind} to remote laptop.")
         except Exception as exc:
             self.on_status(f"Could not send {kind} command: {exc}")
+        return resp
 
-    def update_remote_paused_from_response(self, resp):
+    def note_remote_paused(self, paused, authoritative=False):
+        """Records the receiver's pause state as it reported it. A report
+        that isn't authoritative (a periodic heartbeat, a text
+        acknowledgement) is ignored while we are mid-press or just after
+        one: it was produced before the receiver saw the press, so it
+        describes the OLD state and would flip our guess back."""
+        with self.pause_lock:
+            if not authoritative and (
+                self.pause_worker_active or time.time() - self.pause_last_press < PAUSE_SYNC_QUIET_SECONDS
+            ):
+                return
+            self.remote_typer_paused = paused
+
+    def update_remote_paused_from_response(self, resp, authoritative=False):
         """Reads the receiving laptop's actual current pause state back
         from a LAN response body (see LANRequestHandler._handle_post),
         keeping remote_typer_paused accurate instead of relying purely on
         this laptop's own optimistic guess."""
         try:
-            self.remote_typer_paused = bool(resp.json().get("paused", False))
+            paused = bool(resp.json().get("paused", False))
         except (ValueError, AttributeError):
-            pass
+            return
+        self.note_remote_paused(paused, authoritative)
 
     def on_pause(self):
         self.set_paused_state(not self.paused)
@@ -1850,7 +1938,7 @@ class App:
                         if payload.get("kind") == "heartbeat" and payload.get("role") == "type":
                             self.send_last_peer_heartbeat = time.time()
                             if "paused" in payload:
-                                self.remote_typer_paused = bool(payload.get("paused"))
+                                self.note_remote_paused(bool(payload.get("paused")))
             except Exception as exc:
                 self.send_relay_link_up = False
                 self.send_last_relay_error = str(exc)

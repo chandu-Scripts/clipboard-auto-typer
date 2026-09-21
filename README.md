@@ -7,6 +7,7 @@ Copy text anywhere — an AI response, a document, dictated text — and it appe
 ## Features
 
 - **Clipboard-triggered**: copy text anywhere on your system and it starts appearing in Word automatically — no manual paste needed.
+- **Waits for the final copy**: a copy is used once the clipboard has stopped changing for 0.7 seconds, so apps that copy while you drag to select (like the VS Code terminal) send only the finished selection, not "my", "my na", "my name"…
 - **Adjustable typing speed** (20–300 WPM) via a slider.
 - **Customizable font**: set the font name and size typed text uses — a real, persistent Word document property, so it doesn't reset itself the way Notepad's zoom/display font used to.
 - **Pause / Resume**:

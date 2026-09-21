@@ -26,6 +26,11 @@ import win32process
 from PIL import Image, ImageDraw
 
 CLIPBOARD_POLL_SECONDS = 0.15
+# Some apps (the VS Code terminal's copy-on-select, for one) copy continuously
+# while you drag to select, so the clipboard passes through "my", "my na", ...
+# "my name is chandu". A copy is only acted on once the clipboard has stopped
+# changing for this long, so only the final selection is used.
+CLIPBOARD_SETTLE_SECONDS = 0.7
 
 # Inserted between an old (possibly interrupted, mid-sentence) entry and a
 # newly started one, since entries are no longer cleared - a full dashed
@@ -926,6 +931,27 @@ def force_foreground(hwnd):
             win32process.AttachThreadInput(current_thread, fg_thread, False)
 
 
+class ClipboardSettler:
+    """Tells a polling loop when a new clipboard value is final: only once
+    it has stayed the same for CLIPBOARD_SETTLE_SECONDS. Every change
+    restarts the wait, so a selection still being dragged is never used."""
+
+    def __init__(self):
+        self.text = None
+        self.since = 0.0
+
+    def ready(self, current, now=None):
+        now = time.time() if now is None else now
+        if current != self.text:
+            self.text = current
+            self.since = now
+            return False
+        return now - self.since >= CLIPBOARD_SETTLE_SECONDS
+
+    def reset(self):
+        self.text = None
+
+
 def create_tray_icon_image():
     """Generates the system tray icon in memory - no bundled asset file
     needed. Just a simple, distinctive colored square, not meant to be
@@ -1544,6 +1570,7 @@ class App:
         # document's existing content before a new job starts), so it
         # needs its own COM init too.
         pythoncom.CoInitialize()
+        settler = ClipboardSettler()
         while True:
             time.sleep(CLIPBOARD_POLL_SECONDS)
             if not self.clipboard_watch_enabled:
@@ -1551,7 +1578,10 @@ class App:
             try:
                 current = self.safe_paste()
                 if not current or current == self.last_clipboard_text:
+                    settler.reset()
                     continue
+                if not settler.ready(current):
+                    continue  # still changing (e.g. a selection being dragged)
                 if self.typer.is_running():
                     # A job is active (typing or paused waiting for focus).
                     # Don't let a clipboard change - even an accidental one
@@ -2048,6 +2078,7 @@ class App:
                 self.set_relay_status("Waiting for receiving laptop...")
 
     def clipboard_to_remote_loop(self):
+        settler = ClipboardSettler()
         while True:
             time.sleep(CLIPBOARD_POLL_SECONDS)
             if not self.send_clipboard_remote_enabled or self.remote_config is None:
@@ -2055,7 +2086,10 @@ class App:
             try:
                 current = self.safe_paste()
                 if not current or current == self.last_sent_clipboard_text:
+                    settler.reset()
                     continue
+                if not settler.ready(current):
+                    continue  # still changing (e.g. a selection being dragged) - send only the final text
                 secret = self.remote_config["secret"]
                 payload = json.dumps({"secret": secret, "kind": "text", "text": current})
                 if self.connection_type_var.get() == "lan":

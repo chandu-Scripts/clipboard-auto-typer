@@ -1660,6 +1660,8 @@ class App:
                 # copy - that first launch is the slow part (spawning the
                 # process and waiting for its window), so do it up front.
                 threading.Thread(target=self.prelaunch_word, args=(file_path,), daemon=True).start()
+            elif output == "hosted" and self.hosted_link:
+                self.status_label.config(text=f"Hosted board: {self.hosted_link}")
             else:
                 self.status_label.config(text=f"Watching clipboard - Answer Board: {BOARD_URL}")
         else:

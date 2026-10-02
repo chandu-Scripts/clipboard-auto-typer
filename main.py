@@ -1,3 +1,4 @@
+import hashlib
 import http.server
 import json
 import os
@@ -149,12 +150,15 @@ TOKEN_PATTERN = re.compile(r"\S+|\s+")
 def load_remote_config():
     """Loads the shared secret used by both the internet relay (ntfy.sh
     topic) and the direct LAN connection, plus their optional settings
-    (lan_port, lan_receiver_ip). Returns None if the file is missing or
-    malformed, so remote features are simply unavailable rather than
-    crashing the app - the file deliberately isn't committed to git (see
-    remote_config.example.json). lan_receiver_ip is specific to whichever
-    laptop is doing the sending - it's harmless (just unused) if present
-    in a copy of this file on a laptop that's only receiving."""
+    (lan_port, lan_receiver_ip, firebase_db_url, firebase_hosting_url).
+    Returns None if the file is missing or malformed, so remote features
+    are simply unavailable rather than crashing the app - the file
+    deliberately isn't committed to git (see remote_config.example.json).
+    lan_receiver_ip is specific to whichever laptop is doing the sending -
+    it's harmless (just unused) if present in a copy of this file on a
+    laptop that's only receiving. firebase_db_url/firebase_hosting_url are
+    only needed for Output: Web page (hosted) - see
+    App.start_hosted_relay and the README's Hosted Answer Board section."""
     if not os.path.exists(REMOTE_CONFIG_PATH):
         return None
     try:
@@ -167,6 +171,8 @@ def load_remote_config():
                 "secret": secret,
                 "lan_port": data.get("lan_port", LAN_DEFAULT_PORT),
                 "lan_receiver_ip": data.get("lan_receiver_ip", ""),
+                "firebase_db_url": data.get("firebase_db_url", ""),
+                "firebase_hosting_url": data.get("firebase_hosting_url", ""),
             }
     except (OSError, ValueError):
         pass
@@ -448,10 +454,22 @@ class BoardHub:
         self._text = ""
         self._status = {"state": "idle", "done": 0, "total": 0}
         self._subscribers = []
+        self._relay = None
 
     def has_text(self):
         with self._lock:
             return bool(self._text.strip())
+
+    def set_relay(self, relay):
+        """Attaches (or detaches, with relay=None) a FirebaseRelay so every
+        append/clear/status below also mirrors to the hosted board - see
+        App.start_hosted_relay. Stopping the old relay happens outside the
+        lock since FirebaseRelay.stop() only enqueues, but never block the
+        lock on anything that could wait on the network."""
+        with self._lock:
+            old, self._relay = self._relay, relay
+        if old is not None:
+            old.stop()
 
     def append(self, chunk):
         if not chunk:
@@ -478,14 +496,21 @@ class BoardHub:
             self._text = self._text[-BOARD_MAX_CHARS:]
             # Pages hold the untrimmed text - resync them all instead
             # of sending a chunk they'd append to the wrong base.
-            self._broadcast_locked("snapshot", self._snapshot_locked())
+            snapshot = self._snapshot_locked()
+            self._broadcast_locked("snapshot", snapshot)
+            if self._relay is not None:
+                self._relay.snapshot(snapshot["text"], snapshot["status"])
             return
         self._broadcast_locked("append", chunk)
+        if self._relay is not None:
+            self._relay.append(chunk)
 
     def clear(self):
         with self._lock:
             self._text = ""
             self._broadcast_locked("clear", None)
+            if self._relay is not None:
+                self._relay.clear()
 
     def set_status(self, state, done=None, total=None):
         with self._lock:
@@ -495,6 +520,8 @@ class BoardHub:
             if total is not None:
                 self._status["total"] = total
             self._broadcast_locked("status", dict(self._status))
+            if self._relay is not None:
+                self._relay.status(dict(self._status))
 
     def subscribe(self):
         """Returns (queue, snapshot) atomically, so a page never misses or
@@ -525,6 +552,85 @@ class BoardHub:
                 # notices it's no longer subscribed and ends, and the
                 # browser reconnects with a fresh snapshot.
                 self._subscribers.remove(q)
+
+
+class FirebaseRelay:
+    """Mirrors one BoardHub's events to a Firebase Realtime Database room,
+    so the same typed text that updates the local Answer Board also
+    reaches a publicly hosted copy of the page (board.html's Firebase-mode
+    transport - see the README's Hosted Answer Board section). Talks to
+    Firebase's plain HTTPS REST API, not the Firebase SDK, so this needs
+    no new dependency beyond `requests`.
+
+    All network calls happen on one dedicated worker thread; every public
+    method here only ever enqueues work and returns immediately, so the
+    typing thread (which calls through BoardHub) is never blocked waiting
+    on this relay's network.
+
+    Text is grouped into "generations" rather than one ever-growing node:
+    clearing the board starts a new generation and points current_gen at
+    it, rather than deleting+recreating the old one (which would race
+    with anyone still reading it). Old generations are simply abandoned -
+    harmless, since the text volumes this app produces are tiny next to
+    the free tier's storage limit, not worth the extra failure mode of
+    also deleting them."""
+
+    def __init__(self, db_url, room_id):
+        self.base = f"{db_url.rstrip('/')}/rooms/{room_id}"
+        self.queue = queue.Queue()
+        self.current_gen = None
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def append(self, chunk):
+        self.queue.put(("append", chunk))
+
+    def clear(self):
+        self.queue.put(("clear", None))
+
+    def status(self, status_dict):
+        self.queue.put(("status", status_dict))
+
+    def snapshot(self, text, status_dict):
+        self.queue.put(("snapshot", (text, status_dict)))
+
+    def stop(self):
+        self.queue.put(None)  # unblocks the worker's queue.get() so it can exit
+
+    def _worker(self):
+        try:
+            self._new_generation()
+        except Exception:
+            pass  # best-effort - the first real write below will retry via its own try/except
+        while True:
+            item = self.queue.get()
+            if item is None:
+                return
+            kind, data = item
+            try:
+                if kind == "append":
+                    self._append(data)
+                elif kind == "clear":
+                    self._new_generation()
+                elif kind == "status":
+                    self._put_status(data)
+                elif kind == "snapshot":
+                    text, status = data
+                    self._new_generation()
+                    if text:
+                        self._append(text)
+                    self._put_status(status)
+            except Exception:
+                pass  # a dropped update just leaves hosted viewers briefly stale, never crashes typing
+
+    def _new_generation(self):
+        self.current_gen = str(int(time.time() * 1000))
+        requests.put(f"{self.base}/current_gen.json", data=json.dumps(self.current_gen), timeout=10)
+
+    def _append(self, chunk):
+        requests.post(f"{self.base}/gens/{self.current_gen}/chunks.json", data=json.dumps(chunk), timeout=10)
+
+    def _put_status(self, status_dict):
+        requests.put(f"{self.base}/status.json", data=json.dumps(status_dict), timeout=10)
 
 
 class BoardServer(LANServer):
@@ -1021,7 +1127,9 @@ class App:
         output_frame.pack(fill="x", padx=10, pady=(0, 6))
         tk.Label(output_frame, text="Output:").pack(side="left")
         self.output_var = tk.StringVar(value="word")
-        for label, value in (("Word", "word"), ("Web page", "web"), ("Both", "both")):
+        for label, value in (
+            ("Word", "word"), ("Web page", "web"), ("Both", "both"), ("Web page (hosted)", "hosted"),
+        ):
             tk.Radiobutton(
                 output_frame, text=label, variable=self.output_var, value=value, command=self.on_output_change
             ).pack(side="left", padx=(6, 0))
@@ -1110,6 +1218,8 @@ class App:
         self.board_server = None
         self.board_stop_thread = None
         self.board_lock = threading.Lock()
+        self.board_relay = None
+        self.hosted_link = None
 
         self.clipboard_watch_enabled = False
         self.last_clipboard_text = ""
@@ -1245,7 +1355,7 @@ class App:
         if isinstance(font_size, int) and 6 <= font_size <= 96:
             self.font_size_var.set(font_size)
         output = settings.get("output")
-        if output in ("word", "web", "both"):
+        if output in ("word", "web", "both", "hosted"):
             self.output_var.set(output)
             self.on_output_change()
 
@@ -1535,7 +1645,9 @@ class App:
             if use_word and not file_path:
                 self.status_label.config(text="Select a Word document path first.")
                 return
-            if output in ("web", "both") and not self.start_board_server():
+            if output in ("web", "both", "hosted") and not self.start_board_server():
+                return
+            if output == "hosted" and not self.start_hosted_relay():
                 return
             self.clipboard_watch_enabled = True
             self.last_clipboard_text = self.safe_paste()
@@ -1627,7 +1739,7 @@ class App:
 
         output = self.output_var.get()
         use_word = output in ("word", "both")
-        use_board = output in ("web", "both")
+        use_board = output in ("web", "both", "hosted")
 
         file_path = self.file_path_var.get().strip()
         if use_word and not file_path:
@@ -1715,19 +1827,65 @@ class App:
             self.board_stop_thread.start()
 
     def on_output_change(self):
-        if self.output_var.get() in ("web", "both"):
-            if self.start_board_server():
-                self.open_board_btn.config(state="normal")
-                self.status_label.config(text=f"Answer Board ready: {BOARD_URL}")
-            else:
-                self.output_var.set("word")
-                self.open_board_btn.config(state="disabled")
-        else:
+        output = self.output_var.get()
+        if output not in ("web", "both", "hosted"):
+            self.stop_hosted_relay()
             self.stop_board_server()
             self.open_board_btn.config(state="disabled")
+            return
+        if not self.start_board_server():
+            self.output_var.set("word")
+            self.open_board_btn.config(state="disabled")
+            self.stop_hosted_relay()
+            return
+        self.open_board_btn.config(state="normal")
+        if output != "hosted":
+            self.stop_hosted_relay()
+            self.status_label.config(text=f"Answer Board ready: {BOARD_URL}")
+        elif self.start_hosted_relay():
+            if self.hosted_link:
+                self.status_label.config(text=f"Hosted board: {self.hosted_link}")
+            else:
+                self.status_label.config(
+                    text=f"Answer Board ready: {BOARD_URL} (add firebase_hosting_url to "
+                    "remote_config.json for a shareable link)"
+                )
+        else:
+            self.output_var.set("web")  # hosting misconfigured - stay on the working local board instead
 
     def open_board(self):
         webbrowser.open(BOARD_URL)
+
+    # ---- Hosted Answer Board (Firebase relay) ----
+
+    def start_hosted_relay(self):
+        """Starts mirroring the Answer Board to Firebase if it isn't
+        already running. Needs remote_config.json's firebase_db_url - see
+        the README's Hosted Answer Board section for the one-time setup.
+        Idempotent and safe to call from any thread, like
+        start_board_server."""
+        if self.board_relay is not None:
+            return True
+        if self.remote_config is None:
+            self.on_status("Hosted board needs remote_config.json (same file as the LAN/relay secret).")
+            return False
+        db_url = self.remote_config.get("firebase_db_url", "").strip()
+        if not db_url:
+            self.on_status("Hosted board needs 'firebase_db_url' in remote_config.json - see README.")
+            return False
+        room_id = hashlib.sha256(self.remote_config["secret"].encode("utf-8")).hexdigest()
+        self.board_relay = FirebaseRelay(db_url, room_id)
+        self.board.set_relay(self.board_relay)
+        hosting_url = self.remote_config.get("firebase_hosting_url", "").strip()
+        self.hosted_link = f"{hosting_url.rstrip('/')}/?r={room_id}" if hosting_url else None
+        return True
+
+    def stop_hosted_relay(self):
+        if self.board_relay is None:
+            return
+        self.board.set_relay(None)
+        self.board_relay = None
+        self.hosted_link = None
 
     # ---- web remote trigger flow ----
 
@@ -1745,7 +1903,9 @@ class App:
         if use_word and not file_path:
             self.status_label.config(text="Select a Word document path first.")
             return
-        if output in ("web", "both") and not self.start_board_server():
+        if output in ("web", "both", "hosted") and not self.start_board_server():
+            return
+        if output == "hosted" and not self.start_hosted_relay():
             return
         if self.connection_type_var.get() == "lan":
             port = self.remote_config.get("lan_port", LAN_DEFAULT_PORT)

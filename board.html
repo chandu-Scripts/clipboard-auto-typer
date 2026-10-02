@@ -357,33 +357,118 @@
     $("pill-text").textContent = label;
   }
 
-  // ---- live stream from the app ----
+  // ---- live stream from the app: localhost talks to it directly over SSE;
+  // anywhere else (this page deployed to Firebase Hosting) means the app is
+  // on a different machine entirely, so the connection goes through the
+  // Firebase Realtime Database room main.py's FirebaseRelay mirrors into -
+  // see main.py's FirebaseRelay and the README's Hosted Answer Board
+  // section. Same on-screen result either way: text appears live, Copy /
+  // Save / Clear / History / speech / Self Intro all behave identically,
+  // since only how new text ARRIVES differs, never what the page does with it. ----
   var linkEl = $("link");
   function setLink(up) {
     linkEl.classList.toggle("up", up);
     $("link-text").textContent = up ? "Connected" : "Reconnecting…";
   }
-  var source = new EventSource("/stream");
-  source.onopen = function () { setLink(true); };
-  source.onerror = function () { setLink(false); };
-  source.addEventListener("snapshot", function (e) {
-    var d = JSON.parse(e.data);
-    textNode.data = d.text;
-    setStatus(d.status);
-    if (following) followIfNeeded();
-    updateJump();
-  });
-  source.addEventListener("append", function (e) {
-    textNode.appendData(JSON.parse(e.data));
-    followIfNeeded();
-    updateJump();
-  });
-  source.addEventListener("clear", function () {
-    textNode.data = "";
-    following = true;
-    updateJump();
-  });
-  source.addEventListener("status", function (e) { setStatus(JSON.parse(e.data)); });
+
+  function isLocalPage() {
+    return location.hostname === "localhost" || location.hostname === "127.0.0.1";
+  }
+
+  // ---- Fill these in once, after creating your own Firebase project (see
+  // README "Hosted Answer Board") - apiKey is not secret in Firebase's
+  // client SDK model (access is controlled by the Database Rules, not by
+  // hiding this), so it's fine to deploy as plain text here. Declared
+  // before the isLocalPage() branch below so they're already assigned by
+  // the time connectHosted() can run, not just hoisted-but-undefined. ----
+  var FIREBASE_CONFIG = {
+    apiKey: "YOUR_API_KEY",
+    databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+    projectId: "YOUR_PROJECT",
+  };
+  var FIREBASE_SDK_VERSION = "12.19.0";
+
+  if (isLocalPage()) {
+    var source = new EventSource("/stream");
+    source.onopen = function () { setLink(true); };
+    source.onerror = function () { setLink(false); };
+    source.addEventListener("snapshot", function (e) {
+      var d = JSON.parse(e.data);
+      textNode.data = d.text;
+      setStatus(d.status);
+      if (following) followIfNeeded();
+      updateJump();
+    });
+    source.addEventListener("append", function (e) {
+      textNode.appendData(JSON.parse(e.data));
+      followIfNeeded();
+      updateJump();
+    });
+    source.addEventListener("clear", function () {
+      textNode.data = "";
+      following = true;
+      updateJump();
+    });
+    source.addEventListener("status", function (e) { setStatus(JSON.parse(e.data)); });
+  } else {
+    connectHosted();
+  }
+
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var el = document.createElement("script");
+      el.src = src;
+      el.onload = resolve;
+      el.onerror = function () { reject(new Error("failed to load " + src)); };
+      document.head.appendChild(el);
+    });
+  }
+
+  function connectHosted() {
+    var roomId = new URLSearchParams(location.search).get("r");
+    if (!roomId) {
+      setLink(false);
+      $("link-text").textContent = "No room in link";
+      return;
+    }
+    var base = "https://www.gstatic.com/firebasejs/" + FIREBASE_SDK_VERSION + "/";
+    loadScript(base + "firebase-app-compat.js")
+      .then(function () { return loadScript(base + "firebase-database-compat.js"); })
+      .then(function () { startHostedListeners(roomId); })
+      .catch(function () {
+        setLink(false);
+        $("link-text").textContent = "Could not load Firebase";
+        toast("Could not reach Firebase - check your internet connection");
+      });
+  }
+
+  var hostedChunksRef = null;
+  function startHostedListeners(roomId) {
+    firebase.initializeApp(FIREBASE_CONFIG);
+    var db = firebase.database();
+    var roomRef = db.ref("rooms/" + roomId);
+    db.ref(".info/connected").on("value", function (snap) { setLink(!!snap.val()); });
+    roomRef.child("status").on("value", function (snap) {
+      var v = snap.val();
+      if (v) setStatus(v);
+    });
+    roomRef.child("current_gen").on("value", function (snap) {
+      var gen = snap.val();
+      if (!gen) return;
+      if (hostedChunksRef) hostedChunksRef.off();
+      // A new generation means the board was cleared on the sending side -
+      // same reset the local "clear" SSE event does.
+      textNode.data = "";
+      following = true;
+      updateJump();
+      hostedChunksRef = roomRef.child("gens/" + gen + "/chunks");
+      hostedChunksRef.on("child_added", function (chunkSnap) {
+        textNode.appendData(chunkSnap.val());
+        followIfNeeded();
+        updateJump();
+      });
+    });
+  }
 
   // ---- speech: the browser's built-in recognizer, finished phrases go to the app ----
   var LANGS = [

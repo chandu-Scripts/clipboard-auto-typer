@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Answer Board</title>
+<style>
+  :root {
+    --bg: #12141a;
+    --panel: #191c24;
+    --panel-2: #20242e;
+    --line: #2b303c;
+    --text: #e8e6e1;
+    --muted: #8c93a3;
+    --accent: #f2b34a;
+    --accent-ink: #1a1305;
+    --ok: #5cc08a;
+    --info: #6aa8ff;
+    --bad: #ef6b6b;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 "Segoe UI", system-ui, -apple-system, sans-serif;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    overflow: hidden;
+  }
+  button, select, input { font: inherit; color: inherit; }
+  button {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  button:hover { border-color: #444b5c; }
+  button:focus-visible, select:focus-visible, input:focus-visible, .tab:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  button.danger.armed { background: var(--bad); border-color: var(--bad); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 10px 18px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand-block { line-height: 1.15; }
+  .brand { font-weight: 700; font-size: 16px; letter-spacing: .02em; }
+  .brand span { color: var(--accent); }
+  .byline { font-size: 11px; letter-spacing: .03em; }
+  .byline .by { color: #ffffff; }
+  .byline .name { color: var(--accent); }
+  nav { display: flex; gap: 4px; margin-left: 8px; }
+  .tab {
+    background: none; border: 0; border-radius: 8px; padding: 6px 12px; color: var(--muted);
+  }
+  .tab[aria-selected="true"] { background: var(--panel-2); color: var(--text); }
+  .spacer { flex: 1; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 4px 12px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line);
+    font-variant-numeric: tabular-nums;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .pill[data-state="typing"] .dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+  .pill[data-state="paused"] .dot { background: var(--info); }
+  .pill[data-state="done"] .dot { background: var(--ok); }
+  .pill[data-state="stopped"] .dot { background: var(--bad); }
+  .link { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  .link .dot { background: var(--bad); }
+  .link.up .dot { background: var(--ok); }
+  @keyframes pulse { 50% { opacity: .35; transform: scale(.8); } }
+  @media (prefers-reduced-motion: reduce) { .pill[data-state="typing"] .dot { animation: none; } }
+
+  main { min-height: 0; display: grid; }
+  section { min-height: 0; display: none; }
+  section.active { display: grid; }
+
+  #live, #intro { grid-template-rows: auto 1fr; }
+  #intro-text {
+    position: absolute; inset: 0; width: 100%; height: 100%; resize: none;
+    background: var(--bg); color: var(--text); caret-color: var(--accent);
+    border: 0; outline: none; line-height: 1.55;
+    padding: 24px max(18px, calc((100% - 1000px) / 2));
+  }
+  .toolbar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 18px; border-bottom: 1px solid var(--line);
+  }
+  .group { display: inline-flex; align-items: center; gap: 4px; }
+  .size { min-width: 52px; text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
+  select { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+
+  /* Off = red mic with a cross; on (really listening) = green mic. */
+  #mic { padding: 6px 9px; display: inline-flex; align-items: center; color: var(--bad); }
+  #mic svg { display: block; fill: currentColor; }
+  #mic .slash-bg { stroke: var(--panel-2); stroke-width: 4; stroke-linecap: round; }
+  #mic .slash { stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+  #mic.live { color: var(--ok); border-color: var(--ok); animation: micglow 1.6s ease-in-out infinite; }
+  #mic.live .slash-bg, #mic.live .slash { display: none; }
+  @keyframes micglow { 50% { box-shadow: 0 0 0 4px rgba(92,192,138,.25); } }
+  @media (prefers-reduced-motion: reduce) { #mic.live { animation: none; } }
+  .mic-note { color: var(--muted); font-size: 12px; margin-left: 4px; }
+  /* The always-green display-only mic next to the tabs. Not a control. */
+  .mic-show {
+    display: inline-flex; align-items: center; margin-left: -6px; padding: 6px 9px;
+    color: var(--ok); border: 1px solid var(--ok); border-radius: 8px;
+    animation: micglow 1.6s ease-in-out infinite; cursor: default; user-select: none;
+  }
+  .mic-show svg { display: block; fill: currentColor; }
+  @media (prefers-reduced-motion: reduce) { .mic-show { animation: none; } }
+  #interim { color: var(--muted); font-style: italic; }
+
+  .reader { position: relative; min-height: 0; }
+  #text {
+    position: absolute; inset: 0; overflow: auto;
+    padding: 24px max(18px, calc((100% - 1000px) / 2));
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    line-height: 1.55;
+  }
+  #jump {
+    position: absolute; right: 22px; bottom: 18px; display: none;
+    box-shadow: 0 6px 20px rgba(0,0,0,.4);
+  }
+  #jump.show { display: block; }
+
+  #history { grid-template-rows: auto 1fr; }
+  .h-tools { display: flex; gap: 8px; align-items: center; padding: 12px 18px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  #search { flex: 1; min-width: 200px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+  #entries { overflow: auto; padding: 14px max(18px, calc((100% - 1000px) / 2)); display: grid; gap: 10px; align-content: start; }
+  .entry { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; }
+  .entry-head { display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+  .entry-head .spacer { flex: 1; }
+  .entry-body { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 5.2em; overflow: hidden; }
+  .entry.open .entry-body { max-height: none; }
+  .entry-head button { padding: 3px 9px; font-size: 12px; }
+  .none { color: var(--muted); text-align: center; padding: 48px 0; }
+
+  #toast {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 14px; opacity: 0; pointer-events: none; transition: opacity .2s;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand-block">
+    <div class="brand">Answer<span>Board</span></div>
+    <div class="byline"><span class="by">By</span> <span class="name">Chandu</span></div>
+  </div>
+  <nav role="tablist" aria-label="Views">
+    <button class="tab" role="tab" id="tab-live" aria-selected="true" aria-controls="live">Live</button>
+    <button class="tab" role="tab" id="tab-history" aria-selected="false" aria-controls="history">History</button>
+    <button class="tab" role="tab" id="tab-intro" aria-selected="false" aria-controls="intro">Self Intro</button>
+  </nav>
+  <!-- Purely decorative: no script, no microphone access, never records or transcribes anything. -->
+  <span class="mic-show" id="mic-show" role="img" aria-label="Decorative - not recording" title="Decorative - not recording">
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/>
+    </svg>
+  </span>
+  <div class="spacer"></div>
+  <span class="link" id="link" title="Connection to the app"><span class="dot"></span><span id="link-text">Connecting…</span></span>
+  <span class="pill" id="pill" data-state="idle" role="status" aria-live="polite"><span class="dot"></span><span id="pill-text">Idle</span></span>
+</header>
+
+<main>
+  <section id="live" class="active" role="tabpanel" aria-labelledby="tab-live">
+    <div class="toolbar">
+      <span class="group">
+        <button id="smaller" aria-label="Decrease text size">A−</button>
+        <span class="size" id="size">22px</span>
+        <button id="bigger" aria-label="Increase text size">A+</button>
+      </span>
+      <select id="font" aria-label="Font"></select>
+      <button id="fullscreen">Fullscreen</button>
+      <span class="group">
+        <button id="mic" aria-pressed="false" aria-label="Microphone off - click to turn on" title="Microphone off - click to turn on">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/>
+            <line class="slash-bg" x1="4" y1="4" x2="20" y2="20"/>
+            <line class="slash" x1="4" y1="4" x2="20" y2="20"/>
+          </svg>
+        </button>
+        <select id="lang" aria-label="Speech language"></select>
+        <span id="mic-note" class="mic-note" role="status" aria-live="polite"></span>
+      </span>
+      <span class="spacer"></span>
+      <button id="copy">Copy</button>
+      <button id="save" class="primary">Save to history</button>
+      <button id="clear" class="danger">Clear</button>
+    </div>
+    <div class="reader">
+      <div id="text" tabindex="0" aria-label="Answers"></div>
+      <button id="jump" class="primary">Jump to latest ↓</button>
+    </div>
+  </section>
+
+  <section id="history" role="tabpanel" aria-labelledby="tab-history">
+    <div class="h-tools">
+      <input id="search" type="search" placeholder="Search saved answers…" aria-label="Search saved answers">
+      <span id="count" class="size"></span>
+      <button id="clear-all" class="danger">Delete all</button>
+    </div>
+    <div id="entries"></div>
+  </section>
+
+  <section id="intro" role="tabpanel" aria-labelledby="tab-intro">
+    <div class="toolbar">
+      <span class="group">
+        <button id="intro-smaller" aria-label="Decrease text size">A−</button>
+        <span class="size" id="intro-size">22px</span>
+        <button id="intro-bigger" aria-label="Increase text size">A+</button>
+      </span>
+      <span class="spacer"></span>
+      <button id="intro-copy">Copy</button>
+      <button id="intro-clear" class="danger">Clear</button>
+    </div>
+    <div class="reader">
+      <textarea id="intro-text" aria-label="Self intro text" spellcheck="false"></textarea>
+    </div>
+  </section>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var HISTORY_KEY = "answerboard.history.v1";
+  var PREFS_KEY = "answerboard.prefs.v1";
+  var MAX_ENTRIES = 300;
+  var FONTS = [
+    ["Consolas", '"Consolas", "Cascadia Mono", monospace'],
+    ["Cascadia Mono", '"Cascadia Mono", "Consolas", monospace'],
+    ["Courier New", '"Courier New", monospace'],
+    ["Segoe UI", '"Segoe UI", system-ui, sans-serif'],
+    ["Calibri", '"Calibri", "Segoe UI", sans-serif'],
+    ["Arial", 'Arial, Helvetica, sans-serif'],
+    ["Verdana", 'Verdana, sans-serif'],
+    ["Georgia", 'Georgia, serif'],
+    ["Times New Roman", '"Times New Roman", Times, serif']
+  ];
+
+  // ---- storage helpers (localStorage can be blocked or full - never throw) ----
+  function load(key, fallback) {
+    try { var v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch (e) { return fallback; }
+  }
+  function store(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); return true; } catch (e) { return false; }
+  }
+
+  // ---- toast ----
+  var toastTimer = null;
+  function toast(message) {
+    var el = $("toast");
+    el.textContent = message;
+    el.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.classList.remove("show"); }, 2200);
+  }
+
+  // ---- reading area ----
+  var textEl = $("text");
+  var introEl = $("intro-text");
+  var textNode = document.createTextNode("");
+  textEl.appendChild(textNode);
+  // Words the microphone is still working out. Kept after the real text
+  // node, and never part of it, so Copy/Save only ever see finished text.
+  var interimEl = document.createElement("span");
+  interimEl.id = "interim";
+  textEl.appendChild(interimEl);
+  var following = true;
+  var scrollQueued = false;
+
+  function atBottom() {
+    return textEl.scrollHeight - textEl.scrollTop - textEl.clientHeight <= 48;
+  }
+  function updateJump() {
+    $("jump").classList.toggle("show", !following && textNode.data.length > 0);
+  }
+  function followIfNeeded() {
+    if (!following || scrollQueued) return;
+    scrollQueued = true;
+    requestAnimationFrame(function () {
+      scrollQueued = false;
+      textEl.scrollTop = textEl.scrollHeight;
+    });
+  }
+  textEl.addEventListener("scroll", function () {
+    // Scrolling up stops the auto-follow; reaching the bottom again resumes it.
+    following = atBottom();
+    updateJump();
+  });
+  $("jump").addEventListener("click", function () {
+    following = true;
+    textEl.scrollTop = textEl.scrollHeight;
+    updateJump();
+  });
+
+  // ---- preferences: text size + font ----
+  var prefs = load(PREFS_KEY, {});
+  var size = Math.min(72, Math.max(12, Number(prefs.size) || 22));
+  var fontName = FONTS.some(function (f) { return f[0] === prefs.font; }) ? prefs.font : FONTS[0][0];
+  var fontSelect = $("font");
+  FONTS.forEach(function (f) {
+    var o = document.createElement("option");
+    o.value = f[0]; o.textContent = f[0];
+    fontSelect.appendChild(o);
+  });
+  function applyPrefs() {
+    var css = FONTS.filter(function (f) { return f[0] === fontName; })[0][1];
+    textEl.style.fontSize = size + "px";
+    textEl.style.fontFamily = css;
+    introEl.style.fontSize = size + "px";
+    introEl.style.fontFamily = css;
+    $("size").textContent = size + "px";
+    $("intro-size").textContent = size + "px";
+    fontSelect.value = fontName;
+    savePrefs();
+    if (following) followIfNeeded();
+  }
+  function savePrefs() {
+    store(PREFS_KEY, { size: size, font: fontName, lang: prefs.lang });
+  }
+  function smaller() { size = Math.max(12, size - 2); applyPrefs(); }
+  function bigger() { size = Math.min(72, size + 2); applyPrefs(); }
+  $("smaller").addEventListener("click", smaller);
+  $("bigger").addEventListener("click", bigger);
+  $("intro-smaller").addEventListener("click", smaller);
+  $("intro-bigger").addEventListener("click", bigger);
+  fontSelect.addEventListener("change", function () { fontName = fontSelect.value; applyPrefs(); });
+  applyPrefs();
+
+  $("fullscreen").addEventListener("click", function () {
+    if (document.fullscreenElement) { document.exitFullscreen(); }
+    else if (document.documentElement.requestFullscreen) { document.documentElement.requestFullscreen(); }
+  });
+
+  // ---- status pill ----
+  var LABELS = { idle: "Idle", typing: "Typing", paused: "Paused", done: "Done", stopped: "Stopped" };
+  function setStatus(s) {
+    var state = LABELS[s.state] ? s.state : "idle";
+    var label = LABELS[state];
+    if ((state === "typing" || state === "paused") && s.total) label += " · " + s.done + "/" + s.total + " words";
+    $("pill").setAttribute("data-state", state);
+    $("pill-text").textContent = label;
+  }
+
+  // ---- live stream from the app: localhost talks to it directly over SSE;
+  // anywhere else (this page deployed to Firebase Hosting) means the app is
+  // on a different machine entirely, so the connection goes through the
+  // Firebase Realtime Database room main.py's FirebaseRelay mirrors into -
+  // see main.py's FirebaseRelay and the README's Hosted Answer Board
+  // section. Same on-screen result either way: text appears live, Copy /
+  // Save / Clear / History / speech / Self Intro all behave identically,
+  // since only how new text ARRIVES differs, never what the page does with it. ----
+  var linkEl = $("link");
+  function setLink(up) {
+    linkEl.classList.toggle("up", up);
+    $("link-text").textContent = up ? "Connected" : "Reconnecting…";
+  }
+
+  function isLocalPage() {
+    return location.hostname === "localhost" || location.hostname === "127.0.0.1";
+  }
+
+  // ---- Fill these in once, after creating your own Firebase project (see
+  // README "Hosted Answer Board") - apiKey is not secret in Firebase's
+  // client SDK model (access is controlled by the Database Rules, not by
+  // hiding this), so it's fine to deploy as plain text here. Declared
+  // before the isLocalPage() branch below so they're already assigned by
+  // the time connectHosted() can run, not just hoisted-but-undefined. ----
+  var FIREBASE_CONFIG = {
+    apiKey: "YOUR_API_KEY",
+    databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+    projectId: "YOUR_PROJECT",
+  };
+  var FIREBASE_SDK_VERSION = "12.19.0";
+
+  if (isLocalPage()) {
+    var source = new EventSource("/stream");
+    source.onopen = function () { setLink(true); };
+    source.onerror = function () { setLink(false); };
+    source.addEventListener("snapshot", function (e) {
+      var d = JSON.parse(e.data);
+      textNode.data = d.text;
+      setStatus(d.status);
+      if (following) followIfNeeded();
+      updateJump();
+    });
+    source.addEventListener("append", function (e) {
+      textNode.appendData(JSON.parse(e.data));
+      followIfNeeded();
+      updateJump();
+    });
+    source.addEventListener("clear", function () {
+      textNode.data = "";
+      following = true;
+      updateJump();
+    });
+    source.addEventListener("status", function (e) { setStatus(JSON.parse(e.data)); });
+  } else {
+    connectHosted();
+  }
+
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var el = document.createElement("script");
+      el.src = src;
+      el.onload = resolve;
+      el.onerror = function () { reject(new Error("failed to load " + src)); };
+      document.head.appendChild(el);
+    });
+  }
+
+  function connectHosted() {
+    var roomId = new URLSearchParams(location.search).get("r");
+    if (!roomId) {
+      setLink(false);
+      $("link-text").textContent = "No room in link";
+      return;
+    }
+    var base = "https://www.gstatic.com/firebasejs/" + FIREBASE_SDK_VERSION + "/";
+    loadScript(base + "firebase-app-compat.js")
+      .then(function () { return loadScript(base + "firebase-database-compat.js"); })
+      .then(function () { startHostedListeners(roomId); })
+      .catch(function () {
+        setLink(false);
+        $("link-text").textContent = "Could not load Firebase";
+        toast("Could not reach Firebase - check your internet connection");
+      });
+  }
+
+  var hostedChunksRef = null;
+  function startHostedListeners(roomId) {
+    firebase.initializeApp(FIREBASE_CONFIG);
+    var db = firebase.database();
+    var roomRef = db.ref("rooms/" + roomId);
+    db.ref(".info/connected").on("value", function (snap) { setLink(!!snap.val()); });
+    roomRef.child("status").on("value", function (snap) {
+      var v = snap.val();
+      if (v) setStatus(v);
+    });
+    roomRef.child("current_gen").on("value", function (snap) {
+      var gen = snap.val();
+      if (!gen) return;
+      if (hostedChunksRef) hostedChunksRef.off();
+      // A new generation means the board was cleared on the sending side -
+      // same reset the local "clear" SSE event does.
+      textNode.data = "";
+      following = true;
+      updateJump();
+      hostedChunksRef = roomRef.child("gens/" + gen + "/chunks");
+      hostedChunksRef.on("child_added", function (chunkSnap) {
+        textNode.appendData(chunkSnap.val());
+        followIfNeeded();
+        updateJump();
+      });
+    });
+  }
+
+  // ---- speech: the browser's built-in recognizer, finished phrases go to the app ----
+  var LANGS = [
+    ["English (India)", "en-IN"], ["English (US)", "en-US"], ["English (UK)", "en-GB"],
+    ["Hindi", "hi-IN"], ["Telugu", "te-IN"], ["Tamil", "ta-IN"],
+    ["Spanish", "es-ES"], ["French", "fr-FR"], ["German", "de-DE"]
+  ];
+  var langSelect = $("lang");
+  LANGS.forEach(function (l) {
+    var o = document.createElement("option");
+    o.value = l[1]; o.textContent = l[0];
+    langSelect.appendChild(o);
+  });
+  langSelect.value = LANGS.some(function (l) { return l[1] === prefs.lang; }) ? prefs.lang : "en-IN";
+  langSelect.addEventListener("change", function () {
+    prefs.lang = langSelect.value;
+    savePrefs();
+    if (listening) { restartRecognizer(); }
+  });
+
+  var micBtn = $("mic");
+  var micNote = $("mic-note");
+  var recog = null;
+  var listening = false;       // what the user asked for; the browser may stop on its own
+  var retryDelay = 250;        // grows while restarts keep failing, resets after a healthy session
+  var retryTimer = null;
+  var lastStart = 0;
+  var lastError = "";
+
+  // Looked up when used, not at load, so it can be swapped for a test double.
+  function getRecognizer() { return window.SpeechRecognition || window.webkitSpeechRecognition; }
+
+  function setInterim(text) {
+    var t = text.trim();
+    // Same spacing rule the app applies to finished phrases, so the words
+    // don't jump when they turn into real text.
+    var needsSpace = t && textNode.data && !/\s$/.test(textNode.data);
+    interimEl.textContent = t ? (needsSpace ? " " : "") + t : "";
+    followIfNeeded();
+  }
+  function setMicNote(text) { micNote.textContent = text || ""; }
+  function updateMic() {
+    var label = listening ? "Microphone on - click to turn off" : "Microphone off - click to turn on";
+    micBtn.classList.toggle("live", listening);
+    micBtn.setAttribute("aria-pressed", String(listening));
+    micBtn.setAttribute("aria-label", label);
+    micBtn.title = label;
+  }
+  function sendPhrase(text) {
+    text = text.trim();
+    if (!text) return;
+    fetch("/append", {
+      method: "POST",
+      headers: { "X-Board": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text })
+    }).then(function (r) {
+      if (!r.ok) throw new Error("bad status");
+    }).catch(function () { toast("Could not add spoken text - is the app running?"); });
+  }
+  function stopListening(message) {
+    listening = false;
+    clearTimeout(retryTimer);
+    if (recog) { try { recog.abort(); } catch (e) { /* already stopped */ } }
+    recog = null;
+    setInterim("");
+    setMicNote("");
+    updateMic();
+    if (message) toast(message);
+  }
+  // Listening stays on until the user turns it off. Only these mean it
+  // truly can't continue; everything else (silence, a dropped connection, the
+  // browser ending a long session) is retried, backing off up to 5 seconds.
+  var FATAL = {
+    "not-allowed": "Microphone is blocked - allow it in the address bar, then turn it on again",
+    "service-not-allowed": "Speech recognition is blocked in this browser",
+    "audio-capture": "No microphone found",
+    "language-not-supported": "This language isn't supported by the browser's speech service"
+  };
+  function scheduleRestart(mine) {
+    var delay = retryDelay;
+    retryDelay = Math.min(retryDelay * 2, 5000);
+    clearTimeout(retryTimer);
+    retryTimer = setTimeout(function () { if (listening && mine === recog) startRecognizer(); }, delay);
+  }
+  function startRecognizer() {
+    var Rec = getRecognizer();
+    recog = new Rec();
+    recog.lang = langSelect.value;
+    recog.continuous = true;
+    recog.interimResults = true;
+    var mine = recog;
+    recog.onresult = function (e) {
+      if (mine !== recog) return;
+      retryDelay = 250;
+      setMicNote("");
+      var interim = "";
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        var r = e.results[i];
+        if (r.isFinal) { sendPhrase(r[0].transcript); } else { interim += r[0].transcript; }
+      }
+      setInterim(interim);
+    };
+    recog.onerror = function (e) {
+      if (mine !== recog) return;
+      if (FATAL[e.error]) { stopListening(FATAL[e.error]); return; }
+      lastError = e.error;              // soft: onend follows and restarts
+    };
+    recog.onend = function () {
+      if (mine !== recog) return;       // replaced or stopped on purpose
+      setInterim("");
+      if (!listening) return;
+      if (Date.now() - lastStart >= 2000 && lastError !== "network") {
+        retryDelay = 250;               // a normal end (silence timeout): carry straight on
+        setMicNote("");
+      } else {
+        setMicNote(lastError === "network" ? "No connection - retrying…" : "Reconnecting…");
+      }
+      lastError = "";
+      scheduleRestart(mine);
+    };
+    lastStart = Date.now();
+    try { recog.start(); } catch (e) { scheduleRestart(mine); }
+  }
+  function restartRecognizer() {
+    var old = recog;
+    recog = null;
+    clearTimeout(retryTimer);
+    retryDelay = 250;
+    setMicNote("");
+    if (old) { try { old.abort(); } catch (e) { /* already stopped */ } }
+    startRecognizer();
+  }
+  micBtn.addEventListener("click", function () {
+    if (listening) { stopListening(); return; }
+    if (!getRecognizer()) { toast("Speech needs Chrome or Edge"); return; }
+    listening = true;
+    retryDelay = 250;
+    updateMic();
+    startRecognizer();
+  });
+  if (!getRecognizer()) {
+    micBtn.title = "Speech recognition needs Chrome or Edge";
+    micBtn.disabled = true;
+    langSelect.disabled = true;
+  }
+
+  // ---- copy / save / clear ----
+  function copyText(text, doneMessage) {
+    function fallback() {
+      var ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      toast(ok ? doneMessage : "Could not copy");
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { toast(doneMessage); }, fallback);
+    } else { fallback(); }
+  }
+  $("copy").addEventListener("click", function () {
+    if (!textNode.data) { toast("Nothing to copy yet"); return; }
+    copyText(textNode.data, "Copied");
+  });
+  $("save").addEventListener("click", function () {
+    var text = textNode.data;
+    if (!text.trim()) { toast("Nothing to save yet"); return; }
+    var list = load(HISTORY_KEY, []);
+    list.unshift({ id: Date.now() + "-" + Math.random().toString(36).slice(2, 7), ts: Date.now(), text: text });
+    if (list.length > MAX_ENTRIES) list.length = MAX_ENTRIES;
+    toast(store(HISTORY_KEY, list) ? "Saved to history" : "Could not save (browser storage is full or blocked)");
+    if ($("history").classList.contains("active")) renderHistory();
+  });
+
+  // A destructive button asks twice: first click arms it for 3 seconds.
+  function twoStep(button, idleLabel, armedLabel, action) {
+    var timer = null;
+    button.addEventListener("click", function () {
+      if (button.classList.contains("armed")) {
+        clearTimeout(timer);
+        button.classList.remove("armed"); button.textContent = idleLabel;
+        action();
+        return;
+      }
+      button.classList.add("armed"); button.textContent = armedLabel;
+      timer = setTimeout(function () { button.classList.remove("armed"); button.textContent = idleLabel; }, 3000);
+    });
+  }
+  $("clear").addEventListener("click", function () {
+    if (!textNode.data) { toast("Nothing to clear"); return; }
+    fetch("/clear", { method: "POST", headers: { "X-Board": "1" } }).then(function (r) {
+      if (!r.ok) throw new Error("bad status");
+      toast("Cleared");
+    }).catch(function () { toast("Could not clear - is the app running?"); });
+  });
+
+  // ---- history view ----
+  var openIds = {};
+  function fmt(ts) {
+    return new Date(ts).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+  }
+  function renderHistory() {
+    var all = load(HISTORY_KEY, []);
+    var q = $("search").value.trim().toLowerCase();
+    var list = q ? all.filter(function (e) { return e.text.toLowerCase().indexOf(q) !== -1; }) : all;
+    $("count").textContent = all.length + " saved";
+    $("clear-all").disabled = all.length === 0;
+    var box = $("entries");
+    box.textContent = "";
+    if (!list.length) {
+      var none = document.createElement("div");
+      none.className = "none";
+      none.textContent = all.length ? "No saved answers match your search." : "No saved answers yet. Use “Save to history” on the Live view.";
+      box.appendChild(none);
+      return;
+    }
+    list.forEach(function (e) {
+      var card = document.createElement("div");
+      card.className = "entry" + (openIds[e.id] ? " open" : "");
+      var head = document.createElement("div");
+      head.className = "entry-head";
+      var when = document.createElement("span");
+      when.textContent = fmt(e.ts) + " · " + e.text.length.toLocaleString() + " characters";
+      var sp = document.createElement("span"); sp.className = "spacer";
+      var toggle = document.createElement("button");
+      toggle.textContent = openIds[e.id] ? "Collapse" : "Expand";
+      toggle.addEventListener("click", function () {
+        openIds[e.id] = !openIds[e.id];
+        renderHistory();
+      });
+      var cp = document.createElement("button");
+      cp.textContent = "Copy";
+      cp.addEventListener("click", function () { copyText(e.text, "Copied"); });
+      var del = document.createElement("button");
+      del.textContent = "Delete";
+      del.addEventListener("click", function () {
+        store(HISTORY_KEY, load(HISTORY_KEY, []).filter(function (x) { return x.id !== e.id; }));
+        renderHistory();
+      });
+      head.append(when, sp, toggle, cp, del);
+      var body = document.createElement("div");
+      body.className = "entry-body";
+      body.textContent = e.text;
+      card.append(head, body);
+      box.appendChild(card);
+    });
+  }
+  $("search").addEventListener("input", renderHistory);
+  twoStep($("clear-all"), "Delete all", "Click again to delete all", function () {
+    store(HISTORY_KEY, []);
+    openIds = {};
+    renderHistory();
+    toast("History deleted");
+  });
+
+  // ---- self intro: a paste box, remembered in this browser ----
+  var INTRO_KEY = "answerboard.intro.v1";
+  var storedIntro = load(INTRO_KEY, "");
+  introEl.value = typeof storedIntro === "string" ? storedIntro : "";
+  var introWarned = false;
+  function saveIntro() {
+    if (store(INTRO_KEY, introEl.value)) { introWarned = false; return; }
+    if (!introWarned) {
+      introWarned = true;
+      toast("Too large to remember - it stays here until you refresh the page");
+    }
+  }
+  introEl.addEventListener("input", saveIntro);
+  $("intro-copy").addEventListener("click", function () {
+    if (!introEl.value) { toast("Nothing to copy yet"); return; }
+    copyText(introEl.value, "Copied");
+  });
+  $("intro-clear").addEventListener("click", function () {
+    if (!introEl.value) { toast("Nothing to clear"); return; }
+    introEl.value = "";
+    saveIntro();
+    introEl.focus();
+    toast("Cleared");
+  });
+
+  // ---- tabs ----
+  var VIEWS = ["live", "history", "intro"];
+  function show(view) {
+    VIEWS.forEach(function (v) {
+      var on = v === view;
+      $(v).classList.toggle("active", on);
+      $("tab-" + v).setAttribute("aria-selected", String(on));
+    });
+    if (view === "live") { if (following) { textEl.scrollTop = textEl.scrollHeight; } }
+    else if (view === "history") { renderHistory(); }
+    else { introEl.focus(); }   // ready to paste
+  }
+  VIEWS.forEach(function (v) {
+    $("tab-" + v).addEventListener("click", function () { show(v); });
+  });
+})();
+</script>
+</body>
+</html>

@@ -19,3 +19,8 @@ crash.log
 # OS
 Thumbs.db
 .DS_Store
+
+# Firebase CLI local state (project selection cache, deploy logs) - not shared
+firebase/.firebase/
+firebase-debug.log
+.firebaserc

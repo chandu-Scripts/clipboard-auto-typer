@@ -78,6 +78,7 @@ The **Output** setting (Types mode) chooses where typed text goes:
 | **Word** (default) | The Word document, exactly as before |
 | **Web page** | The Answer Board only — no Word needed (so no document path is required either) |
 | **Both** | Word and the Answer Board at the same time |
+| **Web page (hosted)** | The Answer Board, plus a link anyone can open over the internet — see [Hosted Answer Board](#hosted-answer-board) below |
 
 Click **Open Answer Board** (or browse to `http://localhost:8766/`). The page:
 
@@ -95,6 +96,33 @@ Click **Open Answer Board** (or browse to `http://localhost:8766/`). The page:
 Speech is recognised by your **browser's built-in recognizer**, so it works in Chrome and Edge only. Chrome and Edge send the audio to Google's or Microsoft's speech service, so it needs an internet connection — the Answer Board page itself is still only reachable from this laptop. The first time you click the microphone icon, the browser asks for microphone permission. Once on, it stays on until you click the icon again: silences, a dropped connection, or the browser ending a long session are retried automatically (a small "Reconnecting…" note shows meanwhile). It only turns itself off for a real blocker — microphone permission denied, no microphone found, or an unsupported language — and says why. Finished phrases are sent to the app and added to the board exactly like typed answers (they survive a page refresh, and Copy / Save / Clear / History all include them). Spoken text goes to the board only, never into Word.
 
 It is served from the same laptop that is typing, on `127.0.0.1` only, so other devices on the network cannot open it. With **Both**, the pause-when-you-leave-Word behaviour also treats the Answer Board's browser window as "focused", so watching the board doesn't pause typing. With **Web page** alone there is no Word window to watch, so only the Pause button, hotkey, and Stop apply.
+
+## Hosted Answer Board
+
+**Output: Web page (hosted)** mirrors the same Answer Board to a link reachable from anywhere with internet — useful when people watching (e.g. mock-interview participants) aren't all on the same Wi-Fi as the two laptops, so you don't have to rely on screen sharing at all. The receiving laptop still does all the typing locally; only the *viewing* page is reachable from elsewhere. It uses [Firebase](https://firebase.google.com) (Google's app-hosting platform), on its free "Spark" plan — no card required for this amount of usage.
+
+Access is gated by the **same shared secret** already in `remote_config.json` — nobody can open the hosted link without it, and there are no separate accounts or passwords to manage.
+
+### One-time setup
+
+1. Go to [console.firebase.google.com](https://console.firebase.google.com) and create a new project (any name).
+2. In the project, open **Build → Realtime Database** and click **Create Database** (any starting mode/location — the rules below replace whatever it starts with). Note the database URL shown at the top, e.g. `https://your-project-default-rtdb.firebaseio.com`.
+3. Open **Build → Hosting** and click **Get started** (you don't need to follow its CLI steps — we have our own `firebase/` folder for that). Note the default site URL, e.g. `https://your-project.web.app`.
+4. Open **Project settings → General**, scroll to "Your apps", click the Web icon (`</>`), and register an app (just a nickname, no Hosting setup needed here either). This shows a `firebaseConfig` object with `apiKey`, `projectId`, etc.
+5. Open `board.html` in the project root and fill in `FIREBASE_CONFIG` near the top of the `<script>` with the `apiKey`, `databaseURL` (from step 2), and `projectId` from that config object. This value is not secret — Firebase access is controlled by the database rules below, not by hiding it.
+6. Add `firebase_db_url` (from step 2) and `firebase_hosting_url` (from step 3) to `remote_config.json` on **both** laptops, alongside the existing `topic`/`secret` — see `remote_config.example.json` for the field names.
+7. Install the Firebase CLI once: `npm install -g firebase-tools` (needs Node.js, already required for nothing else here but this step). Then `firebase login` — this opens a browser to sign in with the Google account that owns the project.
+8. From the `firebase/` folder in this project: `firebase use --add` and pick the project you created. This writes `firebase/.firebaserc`, which is gitignored (it's specific to your own account).
+9. Copy the filled-in `board.html` into the hosting folder and deploy:
+   ```bash
+   copy ..\board.html public\index.html
+   firebase deploy --only hosting,database
+   ```
+   (On macOS/Linux, `cp ../board.html public/index.html` instead of `copy`.) Repeat this copy-and-deploy step any time `board.html` changes — the Hosting folder only has what you've deployed, so it won't pick up edits on its own.
+
+### Using it
+
+Select **Output: Web page (hosted)** on the receiving laptop. The status line shows a link like `https://your-project.web.app/?r=<a long code>` — that code is derived from your shared secret, not the secret itself, so sharing the link doesn't expose it. Send that link to participants; opening it shows the same Live view as the local Answer Board (speech, Self Intro, and History stay private to each viewer's own browser, same as always).
 
 ## Laptop-to-Laptop
 

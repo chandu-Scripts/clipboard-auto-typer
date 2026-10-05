@@ -118,11 +118,27 @@
   .mic-show svg { display: block; fill: currentColor; }
   @media (prefers-reduced-motion: reduce) { .mic-show { animation: none; } }
   #interim { color: var(--muted); font-style: italic; }
+  #committed { outline: none; caret-color: var(--accent); }
+  mark.kw {
+    background: var(--accent); color: var(--accent-ink);
+    border-radius: 4px; padding: 0 3px; font-weight: 600;
+  }
+  [hidden] { display: none !important; }
+  .top { display: block; }
+  #kw-input { flex: 1; min-width: 160px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+  .kw-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; overflow: auto; }
+  .kw-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    background: var(--panel-2); border: 1px solid var(--accent); color: var(--text);
+    border-radius: 999px; padding: 2px 4px 2px 10px;
+  }
+  .kw-chip button { border: 0; background: none; padding: 0 6px; color: var(--muted); font-size: 15px; line-height: 1; }
+  .kw-chip button:hover { color: var(--bad); }
 
   .reader { position: relative; min-height: 0; }
   #text {
     position: absolute; inset: 0; overflow: auto;
-    padding: 24px max(18px, calc((100% - 1000px) / 2));
+    padding: 24px 18px;
     white-space: pre-wrap; overflow-wrap: anywhere;
     line-height: 1.55;
   }
@@ -170,12 +186,14 @@
     </svg>
   </span>
   <div class="spacer"></div>
+  <button id="fullscreen">Fullscreen</button>
   <span class="link" id="link" title="Connection to the app"><span class="dot"></span><span id="link-text">Connecting…</span></span>
   <span class="pill" id="pill" data-state="idle" role="status" aria-live="polite"><span class="dot"></span><span id="pill-text">Idle</span></span>
 </header>
 
 <main>
   <section id="live" class="active" role="tabpanel" aria-labelledby="tab-live">
+    <div class="top">
     <div class="toolbar">
       <span class="group">
         <button id="smaller" aria-label="Decrease text size">A−</button>
@@ -183,7 +201,7 @@
         <button id="bigger" aria-label="Increase text size">A+</button>
       </span>
       <select id="font" aria-label="Font"></select>
-      <button id="fullscreen">Fullscreen</button>
+      <button id="keywords" aria-expanded="false" aria-controls="kw-bar">Keywords</button>
       <span class="group">
         <button id="mic" aria-pressed="false" aria-label="Microphone off - click to turn on" title="Microphone off - click to turn on">
           <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
@@ -199,6 +217,15 @@
       <button id="copy">Copy</button>
       <button id="save" class="primary">Save to history</button>
       <button id="clear" class="danger">Clear</button>
+    </div>
+    <div class="toolbar kw-bar" id="kw-bar" hidden>
+      <input id="kw-input" type="text" placeholder="Add a keyword (one word)…" aria-label="Keyword to highlight" maxlength="40" autocomplete="off" spellcheck="false">
+      <button id="kw-add">Add</button>
+      <button id="kw-upload">Upload .txt</button>
+      <input id="kw-file" type="file" accept=".txt,text/plain" hidden>
+      <span class="kw-list" id="kw-list"></span>
+      <span class="size" id="kw-count"></span>
+    </div>
     </div>
     <div class="reader">
       <div id="text" tabindex="0" aria-label="Answers"></div>
@@ -270,11 +297,96 @@
     toastTimer = setTimeout(function () { el.classList.remove("show"); }, 2200);
   }
 
+  // ---- keywords: words to highlight in the live text, remembered in this browser ----
+  var KEYWORDS_KEY = "answerboard.keywords.v1";
+  var MAX_KEYWORDS = 100;
+  var WORD_ONLY = /^[\p{L}\p{N}_']+$/u;
+  var WORD_SPLIT = /([\p{L}\p{N}_']+)/u;
+  function sanitizeKeywords(list) {
+    var out = [];
+    if (!Array.isArray(list)) return out;
+    list.forEach(function (k) {
+      var t = typeof k === "string" ? k.trim().toLowerCase() : "";
+      if (t && WORD_ONLY.test(t) && out.indexOf(t) === -1 && out.length < MAX_KEYWORDS) out.push(t);
+    });
+    return out;
+  }
+  var keywords = sanitizeKeywords(load(KEYWORDS_KEY, []));
+  var kwSet = new Set(keywords);
+
   // ---- reading area ----
   var textEl = $("text");
   var introEl = $("intro-text");
-  var textNode = document.createTextNode("");
-  textEl.appendChild(textNode);
+  // The finished text as plain text. Copy/Save/Clear read this, never the
+  // highlighted DOM, so highlights can't leak into what gets copied or saved.
+  var committed = "";
+  var committedEl = document.createElement("span");
+  committedEl.id = "committed";
+  committedEl.setAttribute("contenteditable", "true");
+  committedEl.setAttribute("spellcheck", "false");
+  textEl.appendChild(committedEl);
+  // Typing lands where the caret is, mixed in with the incoming words. Edits
+  // feed `committed` directly, so Copy and Save include them too.
+  function syncFromDom() { committed = committedEl.textContent; updateJump(); }
+  function insertAtCaret(text) {
+    var sel = window.getSelection();
+    if (!sel.rangeCount || !committedEl.contains(sel.anchorNode)) {
+      var end = document.createRange();
+      end.selectNodeContents(committedEl);
+      end.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(end);
+    }
+    var range = sel.getRangeAt(0);
+    range.deleteContents();
+    var node = document.createTextNode(text);
+    range.insertNode(node);
+    range.setStartAfter(node);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    syncFromDom();
+  }
+  committedEl.addEventListener("input", syncFromDom);
+  committedEl.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { e.preventDefault(); insertAtCaret("\n"); }
+  });
+  committedEl.addEventListener("paste", function (e) {
+    e.preventDefault();
+    insertAtCaret((e.clipboardData || window.clipboardData).getData("text/plain"));
+  });
+  textEl.addEventListener("mousedown", function (e) {
+    // Clicking the empty space below the text starts typing at the end.
+    if (e.target === textEl) { committedEl.focus(); insertAtCaret(""); }
+  });
+  function addPlain(s) {
+    var last = committedEl.lastChild;
+    if (last && last.nodeType === 3) last.appendData(s);
+    else committedEl.appendChild(document.createTextNode(s));
+  }
+  function appendHighlighted(s) {
+    var parts = s.split(WORD_SPLIT);   // words land at the odd indexes
+    for (var i = 0; i < parts.length; i++) {
+      if (!parts[i]) continue;
+      if (i % 2 === 1 && kwSet.has(parts[i].toLowerCase())) {
+        var mark = document.createElement("mark");
+        mark.className = "kw";
+        mark.textContent = parts[i];
+        committedEl.appendChild(mark);
+      } else {
+        addPlain(parts[i]);
+      }
+    }
+  }
+  function setCommitted(text) {
+    committed = text;
+    committedEl.textContent = "";
+    appendHighlighted(text);
+  }
+  function appendCommitted(chunk) {
+    committed += chunk;
+    appendHighlighted(chunk);
+  }
   // Words the microphone is still working out. Kept after the real text
   // node, and never part of it, so Copy/Save only ever see finished text.
   var interimEl = document.createElement("span");
@@ -287,7 +399,7 @@
     return textEl.scrollHeight - textEl.scrollTop - textEl.clientHeight <= 48;
   }
   function updateJump() {
-    $("jump").classList.toggle("show", !following && textNode.data.length > 0);
+    $("jump").classList.toggle("show", !following && committed.length > 0);
   }
   function followIfNeeded() {
     if (!following || scrollQueued) return;
@@ -342,10 +454,99 @@
   fontSelect.addEventListener("change", function () { fontName = fontSelect.value; applyPrefs(); });
   applyPrefs();
 
+  // The whole page goes fullscreen, not one panel, so the tab bar stays
+  // visible and every view can still be reached.
   $("fullscreen").addEventListener("click", function () {
-    if (document.fullscreenElement) { document.exitFullscreen(); }
-    else if (document.documentElement.requestFullscreen) { document.documentElement.requestFullscreen(); }
+    if (document.fullscreenElement) { document.exitFullscreen(); return; }
+    if (!document.documentElement.requestFullscreen) { toast("Fullscreen isn't supported in this browser"); return; }
+    document.documentElement.requestFullscreen().catch(function () { toast("The browser blocked fullscreen"); });
   });
+  document.addEventListener("fullscreenchange", function () {
+    $("fullscreen").textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen";
+  });
+
+  // ---- keyword list (live view): one word per entry, highlighted wherever it appears ----
+  function saveKeywords() {
+    if (!store(KEYWORDS_KEY, keywords)) toast("Could not remember keywords (browser storage is full or blocked)");
+    kwSet = new Set(keywords);
+    renderKeywords();
+    setCommitted(committed);   // re-highlight what's already on the board
+  }
+  function renderKeywords() {
+    var box = $("kw-list");
+    box.textContent = "";
+    keywords.forEach(function (k) {
+      var chip = document.createElement("span");
+      chip.className = "kw-chip";
+      chip.textContent = k;
+      var x = document.createElement("button");
+      x.textContent = "×";
+      x.setAttribute("aria-label", "Remove keyword " + k);
+      x.addEventListener("click", function () {
+        keywords = keywords.filter(function (y) { return y !== k; });
+        saveKeywords();
+      });
+      chip.appendChild(x);
+      box.appendChild(chip);
+    });
+    $("kw-count").textContent = keywords.length + " / " + MAX_KEYWORDS;
+  }
+  function addKeyword() {
+    var input = $("kw-input");
+    var word = input.value.trim().toLowerCase();
+    if (!word) return;
+    if (!WORD_ONLY.test(word)) { toast("One word only - letters and numbers"); return; }
+    input.value = "";
+    if (kwSet.has(word)) { toast("Already in the list"); return; }
+    if (keywords.length >= MAX_KEYWORDS) { toast("The list is full"); return; }
+    keywords.push(word);
+    saveKeywords();
+    input.focus();
+  }
+  $("keywords").addEventListener("click", function () {
+    var bar = $("kw-bar");
+    bar.hidden = !bar.hidden;
+    $("keywords").setAttribute("aria-expanded", String(!bar.hidden));
+    if (!bar.hidden) $("kw-input").focus();
+  });
+  $("kw-add").addEventListener("click", addKeyword);
+  // A .txt file can hold one word per line or several separated by spaces/commas.
+  // Anything that isn't a single valid word is skipped and counted, not rejected.
+  var KW_FILE_MAX_BYTES = 200 * 1024;
+  $("kw-upload").addEventListener("click", function () { $("kw-file").click(); });
+  $("kw-file").addEventListener("change", function () {
+    var file = this.files && this.files[0];
+    this.value = "";
+    if (!file) return;
+    if (file.size > KW_FILE_MAX_BYTES) { toast("That file is too large - keep keyword files under 200 KB"); return; }
+    var reader = new FileReader();
+    reader.onload = function () {
+      var tokens = String(reader.result).split(/[\s,;]+/);
+      var added = 0, skipped = 0, dupes = 0, full = false;
+      tokens.forEach(function (raw) {
+        if (!raw) return;
+        var word = raw.trim().toLowerCase();
+        if (!WORD_ONLY.test(word)) { skipped++; return; }
+        if (kwSet.has(word)) { dupes++; return; }
+        if (keywords.length >= MAX_KEYWORDS) { full = true; return; }
+        keywords.push(word);
+        kwSet.add(word);
+        added++;
+      });
+      if (added) saveKeywords();
+      var msg = "Added " + added + " keyword" + (added === 1 ? "" : "s");
+      if (dupes) msg += ", " + dupes + " already listed";
+      if (skipped) msg += ", " + skipped + " skipped (not a single word)";
+      if (full) msg += ". The list is full at " + MAX_KEYWORDS;
+      toast(msg);
+    };
+    reader.onerror = function () { toast("Could not read that file"); };
+    reader.readAsText(file);
+  });
+  $("kw-input").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { e.preventDefault(); addKeyword(); }
+  });
+  renderKeywords();
 
   // ---- status pill ----
   var LABELS = { idle: "Idle", typing: "Typing", paused: "Paused", done: "Done", stopped: "Stopped" };
@@ -368,18 +569,18 @@
   source.onerror = function () { setLink(false); };
   source.addEventListener("snapshot", function (e) {
     var d = JSON.parse(e.data);
-    textNode.data = d.text;
+    setCommitted(d.text);
     setStatus(d.status);
     if (following) followIfNeeded();
     updateJump();
   });
   source.addEventListener("append", function (e) {
-    textNode.appendData(JSON.parse(e.data));
+    appendCommitted(JSON.parse(e.data));
     followIfNeeded();
     updateJump();
   });
   source.addEventListener("clear", function () {
-    textNode.data = "";
+    setCommitted("");
     following = true;
     updateJump();
   });
@@ -412,6 +613,14 @@
   var retryTimer = null;
   var lastStart = 0;
   var lastError = "";
+  // Chrome can stop producing results without ever firing onend or onerror,
+  // which leaves the mic showing "on" while nothing is listening. Any
+  // recognizer activity counts as a sign of life; going quiet for this long
+  // restarts the session instead of waiting for an event that may never come.
+  var STALL_MS = 25000;
+  var WATCHDOG_MS = 7000;
+  var lastActivity = 0;
+  var watchdogTimer = null;
 
   // Looked up when used, not at load, so it can be swapped for a test double.
   function getRecognizer() { return window.SpeechRecognition || window.webkitSpeechRecognition; }
@@ -420,7 +629,7 @@
     var t = text.trim();
     // Same spacing rule the app applies to finished phrases, so the words
     // don't jump when they turn into real text.
-    var needsSpace = t && textNode.data && !/\s$/.test(textNode.data);
+    var needsSpace = t && committed && !/\s$/.test(committed);
     interimEl.textContent = t ? (needsSpace ? " " : "") + t : "";
     followIfNeeded();
   }
@@ -446,6 +655,7 @@
   function stopListening(message) {
     listening = false;
     clearTimeout(retryTimer);
+    clearTimeout(watchdogTimer);
     if (recog) { try { recog.abort(); } catch (e) { /* already stopped */ } }
     recog = null;
     setInterim("");
@@ -468,6 +678,15 @@
     clearTimeout(retryTimer);
     retryTimer = setTimeout(function () { if (listening && mine === recog) startRecognizer(); }, delay);
   }
+  function touchActivity() { lastActivity = Date.now(); }
+  function watchdog() {
+    if (!listening) return;
+    if (Date.now() - lastActivity > STALL_MS) {
+      restartRecognizer();
+      setMicNote("Reconnecting…");
+    }
+    watchdogTimer = setTimeout(watchdog, WATCHDOG_MS);
+  }
   function startRecognizer() {
     var Rec = getRecognizer();
     recog = new Rec();
@@ -475,8 +694,10 @@
     recog.continuous = true;
     recog.interimResults = true;
     var mine = recog;
+    recog.onstart = function () { if (mine === recog) touchActivity(); };
     recog.onresult = function (e) {
       if (mine !== recog) return;
+      touchActivity();
       retryDelay = 250;
       setMicNote("");
       var interim = "";
@@ -522,7 +743,18 @@
     listening = true;
     retryDelay = 250;
     updateMic();
+    touchActivity();
     startRecognizer();
+    clearTimeout(watchdogTimer);
+    watchdogTimer = setTimeout(watchdog, WATCHDOG_MS);
+  });
+  // Browsers often pause speech recognition while the tab is in the background
+  // or the connection drops; resume it as soon as the page is back.
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && listening) restartRecognizer();
+  });
+  window.addEventListener("online", function () {
+    if (listening) restartRecognizer();
   });
   if (!getRecognizer()) {
     micBtn.title = "Speech recognition needs Chrome or Edge";
@@ -546,11 +778,11 @@
     } else { fallback(); }
   }
   $("copy").addEventListener("click", function () {
-    if (!textNode.data) { toast("Nothing to copy yet"); return; }
-    copyText(textNode.data, "Copied");
+    if (!committed) { toast("Nothing to copy yet"); return; }
+    copyText(committed, "Copied");
   });
   $("save").addEventListener("click", function () {
-    var text = textNode.data;
+    var text = committed;
     if (!text.trim()) { toast("Nothing to save yet"); return; }
     var list = load(HISTORY_KEY, []);
     list.unshift({ id: Date.now() + "-" + Math.random().toString(36).slice(2, 7), ts: Date.now(), text: text });
@@ -574,7 +806,7 @@
     });
   }
   $("clear").addEventListener("click", function () {
-    if (!textNode.data) { toast("Nothing to clear"); return; }
+    if (!committed) { toast("Nothing to clear"); return; }
     fetch("/clear", { method: "POST", headers: { "X-Board": "1" } }).then(function (r) {
       if (!r.ok) throw new Error("bad status");
       toast("Cleared");

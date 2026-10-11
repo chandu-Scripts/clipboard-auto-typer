@@ -1,3 +1,4 @@
+import hmac
 import http.server
 import json
 import os
@@ -12,6 +13,7 @@ import tkinter as tk
 import traceback
 import webbrowser
 from tkinter import filedialog
+from urllib.parse import parse_qs, urlsplit
 
 import keyboard
 import pyperclip
@@ -528,8 +530,10 @@ class BoardHub:
 
 
 class BoardServer(LANServer):
-    """Serves the Answer Board page and its live text stream on 127.0.0.1
-    only. Expects `hub` (a BoardHub) to be set by the creator."""
+    """Serves the Answer Board page and its live text stream on this
+    machine's loopback address AND its LAN address, so the sending
+    laptop can open the same board too - see lan_ip/secret below.
+    Expects `hub` (a BoardHub) to be set by the creator."""
 
     daemon_threads = True  # open pages must not keep the app alive at exit
 
@@ -537,6 +541,8 @@ class BoardServer(LANServer):
         super().__init__(*args, **kwargs)
         self.hub = None
         self.stopping = threading.Event()
+        self.lan_ip = None   # set by start_board_server - allowed Host header besides localhost
+        self.secret = None   # set by start_board_server - required (as ?s=) from any non-loopback client
 
     def handle_error(self, request, client_address):
         # A browser tab closing mid-stream is normal, not worth a crash.log entry.
@@ -547,12 +553,31 @@ class BoardServer(LANServer):
 
 class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
     def _host_ok(self):
-        # Rejects requests whose Host header isn't this loopback address -
-        # stops another website from reading the board through DNS
-        # rebinding, even though the server only listens on 127.0.0.1.
+        # Rejects requests whose Host header isn't one of this machine's own
+        # addresses - stops another website from reading the board through
+        # DNS rebinding. The LAN IP is included (not a wildcard) so this
+        # still only matches this specific machine, not just any Host header
+        # an attacker chooses to send.
         port = self.server.server_address[1]
         host = (self.headers.get("Host") or "").lower()
-        return host in (f"localhost:{port}", f"127.0.0.1:{port}")
+        allowed = {f"localhost:{port}", f"127.0.0.1:{port}"}
+        if self.server.lan_ip:
+            allowed.add(f"{self.server.lan_ip}:{port}")
+        return host in allowed
+
+    def _authorized(self):
+        # This machine's own browser is always trusted. Anything arriving
+        # from elsewhere on the LAN (the sending laptop) must present the
+        # same shared secret already used for the LAN typing relay, as a
+        # ?s= query value - otherwise anyone on the Wi-Fi who finds the
+        # port could read, clear, or type into live answers.
+        if self.client_address[0] in ("127.0.0.1", "::1"):
+            return True
+        secret = self.server.secret
+        if not secret:
+            return False
+        given = parse_qs(urlsplit(self.path).query).get("s", [""])[0]
+        return hmac.compare_digest(given, secret)
 
     def _reply(self, code, body=b"", content_type="text/plain; charset=utf-8"):
         self.send_response(code)
@@ -569,6 +594,12 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._reply(403, b"Forbidden")
             return
         path = self.path.split("?", 1)[0]
+        if path == "/favicon.ico":
+            self._reply(204)
+            return
+        if not self._authorized():
+            self._reply(403, b"Forbidden - open this from the link with the secret in it")
+            return
         if path in ("/", "/board", "/index.html"):
             try:
                 with open(BOARD_HTML_PATH, "rb") as f:
@@ -590,14 +621,15 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif path == "/stream":
             self._stream()
-        elif path == "/favicon.ico":
-            self._reply(204)
         else:
             self._reply(404, b"Not found")
 
     def do_POST(self):
         if not self._host_ok():
             self._reply(403, b"Forbidden")
+            return
+        if not self._authorized():
+            self._reply(403, b"Forbidden - open this from the link with the secret in it")
             return
         path = self.path.split("?", 1)[0]
         # A custom header makes this a non-simple request, which a browser
@@ -1549,7 +1581,9 @@ class App:
                 # process and waiting for its window), so do it up front.
                 threading.Thread(target=self.prelaunch_word, args=(file_path,), daemon=True).start()
             else:
-                self.status_label.config(text=f"Watching clipboard - Answer Board: {BOARD_URL}")
+                link = self.board_lan_link()
+                suffix = f" | Other laptop: {link}" if link else ""
+                self.status_label.config(text=f"Watching clipboard - Answer Board: {BOARD_URL}{suffix}")
         else:
             self.clipboard_watch_enabled = False
             self.watch_btn.config(text="Enable Clipboard Auto-Type")
@@ -1691,14 +1725,26 @@ class App:
             if stopping is not None:
                 stopping.join(timeout=3)  # a just-stopped server still holds the port until it finishes closing
             try:
-                server = BoardServer(("127.0.0.1", BOARD_PORT), BoardRequestHandler)
+                server = BoardServer(("0.0.0.0", BOARD_PORT), BoardRequestHandler)
             except OSError as exc:
                 self.on_status(f"Could not start the Answer Board on port {BOARD_PORT}: {exc}")
                 return False
             server.hub = self.board
+            server.lan_ip = get_local_ip()
+            server.secret = (self.remote_config or {}).get("secret")
             threading.Thread(target=server.serve_forever, daemon=True).start()
             self.board_server = server
             return True
+
+    def board_lan_link(self):
+        """The link the sending laptop can use to open this same Answer
+        Board, with the shared secret baked in. None if there's no
+        remote_config.json secret to protect it with - LAN access is
+        simply unavailable until one is set up, same as the LAN relay."""
+        secret = (self.remote_config or {}).get("secret")
+        if not secret:
+            return None
+        return f"http://{get_local_ip()}:{BOARD_PORT}/?s={secret}"
 
     def stop_board_server(self):
         with self.board_lock:
@@ -1718,7 +1764,9 @@ class App:
         if self.output_var.get() in ("web", "both"):
             if self.start_board_server():
                 self.open_board_btn.config(state="normal")
-                self.status_label.config(text=f"Answer Board ready: {BOARD_URL}")
+                link = self.board_lan_link()
+                suffix = f" | Other laptop: {link}" if link else ""
+                self.status_label.config(text=f"Answer Board ready: {BOARD_URL}{suffix}")
             else:
                 self.output_var.set("word")
                 self.open_board_btn.config(state="disabled")
@@ -1771,7 +1819,9 @@ class App:
         if use_word:
             threading.Thread(target=self.prelaunch_word, args=(file_path,), daemon=True).start()
         else:
-            self.status_label.config(text=f"Waiting for answers - Answer Board: {BOARD_URL}")
+            link = self.board_lan_link()
+            suffix = f" | Other laptop: {link}" if link else ""
+            self.status_label.config(text=f"Waiting for answers - Answer Board: {BOARD_URL}{suffix}")
 
     def remote_watch_loop(self):
         # Same reason as clipboard_watch_loop/AutoTyper._run - this thread

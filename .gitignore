@@ -15,6 +15,11 @@ remote_config.json
 # Local session state - not shared between laptops, regenerated on use
 app_settings.json
 crash.log
+speech_credentials.json
+speech_credentials.json.tmp
+.test-tmp*/
+.test-artifacts/
+.pytest_cache/
 
 # OS
 Thumbs.db

@@ -85,16 +85,44 @@ Click **Open Answer Board** (or browse to `http://localhost:8766/`). The page:
 - mirrors the typing status (Typing · 12/71 words, Paused, Done, Stopped), including pause/resume;
 - has text size (A− / A+), a font picker, **Fullscreen**, **Copy**, **Save to history**, and **Clear** (one click);
 - keeps a **History** tab of saved answers with search — stored in your browser only;
-- has a **microphone icon** and a language picker: click the icon (red with a cross = off, green = listening), speak, and your words show in grey while you talk, then become normal text on the board (see below);
+- has **Free mic** and **Speechmatics ? Paid** buttons plus a language picker: unfinished speech appears in grey, then finalized text joins the board;
 - has a **Self Intro** tab: a plain box where you paste your self-introduction (it is remembered in this browser until you press **Clear**), with text-size buttons and **Copy**;
-- shows a blank board until text arrives, with a small "By Chandu" credit under the title;
-- has a second, always-green microphone icon next to the **History** tab. It is **decoration only** — it never asks for the microphone, never records, and never converts anything to text (its hover text says "Decorative - not recording"). Only the microphone icon in the toolbar listens.
+- shows a blank board until text arrives, with a small "By Chandu" credit under the title.
 
 ### Speaking to the board
 
-Speech is recognised by your **browser's built-in recognizer**, so it works in Chrome and Edge only. Chrome and Edge send the audio to Google's or Microsoft's speech service, so it needs an internet connection — the Answer Board page itself is still only reachable from this laptop. The first time you click the microphone icon, the browser asks for microphone permission. Once on, it stays on until you click the icon again: silences, a dropped connection, or the browser ending a long session are retried automatically (a small "Reconnecting…" note shows meanwhile). It only turns itself off for a real blocker — microphone permission denied, no microphone found, or an unsupported language — and says why. Finished phrases are sent to the app and added to the board exactly like typed answers (they survive a page refresh, and Copy / Save / Clear / History all include them). Spoken text goes to the board only, never into Word.
+Open **http://localhost:8766/** on the laptop running the app, then allow microphone access.
 
-It is served from the same laptop that is typing, on `127.0.0.1` only, so other devices on the network cannot open it. With **Both**, the pause-when-you-leave-Word behaviour also treats the Answer Board's browser window as "focused", so watching the board doesn't pause typing. With **Web page** alone there is no Word window to watch, so only the Pause button, hotkey, and Stop apply.
+| Button | Recognition | Setup |
+|---|---|---|
+| **Free mic** | Browser speech recognition in a supported browser such as Chrome or Edge | No API key or API bill; generally needs internet. Accuracy depends on the browser service. |
+| **Speechmatics ? Paid** | Speechmatics Enhanced real-time transcription | Your own Speechmatics account, API key, available credit, and internet connection. |
+
+Only one engine runs at a time in a board tab. Click the active button to stop, or click the other to switch. The app asks the current engine to finish its last phrase before switching. Green means the engine has confirmed it is listening; starting, stopping, errors, and reconnecting have separate status messages. Changing tabs no longer forcibly restarts recognition. The language selector is locked while a session is active; stop first to change languages.
+
+**Speechmatics key setup:** click **Settings** in the top bar to open the speech settings dialog, paste your key into the masked field, and click **Save key**. Close the dialog with the ? button, Escape, or a click outside it. **Test** validates the entered key (or the saved key if the field is blank) by requesting a temporary token; it does not record audio or confirm your remaining transcription credit. **Remove** deletes the saved key. Each install keeps its own key, encrypted with Windows DPAPI for the current Windows user, in git-ignored `speech_credentials.json`. Pulling code updates preserves it. If you move to a different Windows user or laptop, enter your key there again. Do not commit or share this file.
+
+Paid audio streams directly from the browser to Speechmatics' EU endpoint using a short-lived token issued by the Python app. The permanent API key is never returned to the browser or placed in browser storage. The paid engine uses the board's current keyword list as additional vocabulary at session start. For example, upload `keywords.txt` before starting to help recognize specialist terms. The free engine's keywords remain display-only highlights.
+
+Both engines deliver final phrases through an ordered queue. Failed deliveries retry with the same phrase ID, preventing duplicate appends while the Python app remains running. Pending final phrases are kept in this tab's session storage when available and retried after refresh. Unfinished previews that could not be finalized are available through **Copy pending text**; they are not silently treated as final transcripts. Copy pending text also lets you recover queued phrases during an outage. Avoid closing the tab before delivery finishes. A Python restart clears live text and duplicate tracking; browser History remains separate.
+
+The free engine retries when its recognition session ends. A paid connection failure stops the paid session and displays an error; click the paid mic to restart after resolving the problem. The app never automatically switches to a paid engine or starts charging on page load. Removing a saved key prevents new paid sessions; stop an active paid microphone separately.
+
+Spoken text goes to the board only, never into Word. Copy, Save to history, Clear, and History work with finalized speech just like typed text.
+
+**Two laptops:** the receiver's board is also viewable through its secret-protected LAN link. Microphone capture and Speechmatics key management are available on the local `localhost` board, not the ordinary HTTP LAN page. Each person who runs their own copy of the app can save their own key. With **Both** output, the Answer Board's browser window also counts as focused for Word typing; with **Web page** only, typing does not require Word focus.
+
+### Development checks
+
+On Windows, install `requirements-dev.txt` into a project virtual environment. Tests use fake microphone audio and a mocked Speechmatics service; they never call paid transcription or open Word. The browser tests use an installed Google Chrome.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest tests -q
+```
+
+Windows DPAPI tests must run as your normal Windows user, not a restricted sandbox identity. `start.bat` uses `.venv` automatically when present.
 
 ## Laptop-to-Laptop
 

@@ -12,6 +12,7 @@ import time
 import tkinter as tk
 import traceback
 import webbrowser
+from collections import OrderedDict
 from tkinter import filedialog
 from urllib.parse import parse_qs, urlsplit
 
@@ -26,6 +27,7 @@ import win32con
 import win32gui
 import win32process
 from PIL import Image, ImageDraw
+import speech_config
 
 CLIPBOARD_POLL_SECONDS = 0.15
 # Some apps (the VS Code terminal's copy-on-select, for one) copy continuously
@@ -450,6 +452,7 @@ class BoardHub:
         self._text = ""
         self._status = {"state": "idle", "done": 0, "total": 0}
         self._subscribers = []
+        self._spoken_ids = OrderedDict()
 
     def has_text(self):
         with self._lock:
@@ -461,7 +464,7 @@ class BoardHub:
         with self._lock:
             self._append_locked(chunk)
 
-    def append_spoken(self, phrase):
+    def append_spoken(self, phrase, phrase_id=None):
         """Adds a finished phrase from the page's microphone. Starts a new
         phrase with a space unless the board is empty or already ends in
         whitespace (e.g. right after a typed answer's newline), so words
@@ -470,8 +473,14 @@ class BoardHub:
         if not phrase:
             return False
         with self._lock:
+            if phrase_id and phrase_id in self._spoken_ids:
+                return True  # retry after a lost HTTP response: already committed
             needs_space = bool(self._text) and not self._text[-1].isspace()
             self._append_locked((" " if needs_space else "") + phrase)
+            if phrase_id:
+                self._spoken_ids[phrase_id] = None
+                if len(self._spoken_ids) > 10000:
+                    self._spoken_ids.popitem(last=False)
         return True
 
     def _append_locked(self, chunk):
@@ -597,6 +606,15 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
         if path == "/favicon.ico":
             self._reply(204)
             return
+        # Public static code contains no credentials or user text. A LAN page
+        # loads these without its secret query string, just like a normal script.
+        if path in ("/board-speech.js", "/speech-audio-worklet.js"):
+            try:
+                with open(os.path.join(os.path.dirname(BOARD_HTML_PATH), path[1:]), "rb") as f:
+                    self._reply(200, f.read(), "application/javascript; charset=utf-8")
+            except OSError:
+                self._reply(404, b"Speech script missing - update all project files.")
+            return
         if not self._authorized():
             self._reply(403, b"Forbidden - open this from the link with the secret in it")
             return
@@ -614,13 +632,17 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header(
                 "Content-Security-Policy",
-                "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; "
+                "default-src 'none'; connect-src 'self' wss://eu.rt.speechmatics.com; "
+                "script-src 'self' 'unsafe-inline'; worker-src 'self'; "
                 "style-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'",
             )
             self.end_headers()
             self.wfile.write(body)
         elif path == "/stream":
             self._stream()
+        elif path == "/speech/settings":
+            if self._speech_local_only():
+                self._json_reply(200, speech_config.key_status())
         else:
             self._reply(404, b"Not found")
 
@@ -641,6 +663,9 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._reply(204)
         elif path == "/append":
             self._append_spoken()
+        elif path in ("/speech/settings", "/speech/token"):
+            if self._speech_local_only():
+                self._speech_request(path)
         else:
             self._reply(404, b"Not found")
 
@@ -654,15 +679,64 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._reply(413, b"Too large")
             return
         try:
-            text = json.loads(self.rfile.read(length).decode("utf-8")).get("text")
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            text = payload.get("text")
+            phrase_id = payload.get("id")
         except (ValueError, AttributeError):
             self._reply(400, b"Expected JSON like {\"text\": \"...\"}")
             return
         if not isinstance(text, str):
             self._reply(400, b"text must be a string")
             return
-        self.server.hub.append_spoken(text)
+        if phrase_id is not None and (not isinstance(phrase_id, str) or not 1 <= len(phrase_id) <= 120):
+            self._reply(400, b"Invalid phrase id")
+            return
+        self.server.hub.append_spoken(text, phrase_id)
         self._reply(204)
+
+    def _json_reply(self, code, data):
+        self._reply(code, json.dumps(data).encode("utf-8"), "application/json; charset=utf-8")
+
+    def _speech_local_only(self):
+        # LAN viewers must not read/change credentials or spend the host's credits.
+        # The Host check and custom POST header also protect against browser CSRF.
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            self._json_reply(403, {"error": "Open localhost:8766 on this laptop to configure and use Speechmatics."})
+            return False
+        origin = self.headers.get("Origin")
+        if origin and origin != "http://" + self.headers.get("Host", ""):
+            self._json_reply(403, {"error": "Speech settings require a same-origin request."})
+            return False
+        return True
+
+    def _speech_request(self, path):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 <= length <= 8192:
+                self._json_reply(413, {"error": "Settings request is too large."})
+                return
+            data = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError()
+        except (ValueError, TypeError):
+            self._json_reply(400, {"error": "Invalid settings request."})
+            return
+        try:
+            if path == "/speech/token":
+                self._json_reply(200, speech_config.create_token())
+            elif data.get("action") == "save":
+                speech_config.save_key(data.get("key"))
+                self._json_reply(200, speech_config.key_status())
+            elif data.get("action") == "remove":
+                speech_config.remove_key()
+                self._json_reply(200, speech_config.key_status())
+            elif data.get("action") == "test":
+                speech_config.create_token(data.get("key") or None)
+                self._json_reply(200, {"message": "Key accepted. Live transcription also needs available account credit."})
+            else:
+                self._json_reply(400, {"error": "Unknown settings action."})
+        except speech_config.SpeechConfigError as exc:
+            self._json_reply(400, {"error": str(exc)})
 
     def _send_event(self, event, data):
         payload = json.dumps(data)  # one line: json escapes newlines

@@ -99,24 +99,37 @@
   .size { min-width: 52px; text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
   select { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
 
-  /* Off = red mic with a cross; on (really listening) = green mic. */
-  #mic { padding: 6px 9px; display: inline-flex; align-items: center; color: var(--bad); }
-  #mic svg { display: block; fill: currentColor; }
+  /* Green is reserved for an engine that has confirmed it is listening. */
+  #mic, #mic-paid { padding: 6px 9px; display: inline-flex; gap: 6px; align-items: center; color: var(--muted); }
+  #mic svg, #mic-paid svg { display: block; fill: currentColor; }
   #mic .slash-bg { stroke: var(--panel-2); stroke-width: 4; stroke-linecap: round; }
   #mic .slash { stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
-  #mic.live { color: var(--ok); border-color: var(--ok); animation: micglow 1.6s ease-in-out infinite; }
+  #mic.live, #mic-paid.live { color: var(--ok); border-color: var(--ok); animation: micglow 1.6s ease-in-out infinite; }
   #mic.live .slash-bg, #mic.live .slash { display: none; }
   @keyframes micglow { 50% { box-shadow: 0 0 0 4px rgba(92,192,138,.25); } }
-  @media (prefers-reduced-motion: reduce) { #mic.live { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { #mic.live, #mic-paid.live { animation: none; } }
   .mic-note { color: var(--muted); font-size: 12px; margin-left: 4px; }
-  /* The always-green display-only mic next to the tabs. Not a control. */
-  .mic-show {
-    display: inline-flex; align-items: center; margin-left: -6px; padding: 6px 9px;
-    color: var(--ok); border: 1px solid var(--ok); border-radius: 8px;
-    animation: micglow 1.6s ease-in-out infinite; cursor: default; user-select: none;
+  .speech-messages { padding: 0 18px; font-size: 12px; }
+  .speech-messages p:empty { display: none; }
+  #speech-error { color: var(--bad); }
+  #speech-pending { color: var(--accent); }
+  #speech-settings { display: inline-flex; align-items: center; gap: 7px; }
+  #speech-settings-panel {
+    width: min(460px, calc(100vw - 32px)); max-height: calc(100vh - 48px);
+    padding: 24px; color: var(--text); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 14px;
+    box-shadow: 0 24px 80px rgba(0,0,0,.5);
   }
-  .mic-show svg { display: block; fill: currentColor; }
-  @media (prefers-reduced-motion: reduce) { .mic-show { animation: none; } }
+  #speech-settings-panel::backdrop { background: rgba(0,0,0,.6); }
+  .settings-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px; }
+  .settings-heading h2 { margin: 0; font-size: 20px; }
+  #speech-settings-close { padding: 2px 9px; font-size: 24px; color: var(--muted); background: none; border: 0; }
+  #speech-settings-panel label { display: block; margin-bottom: 8px; font-weight: 600; }
+  #speech-settings-panel p { color: var(--muted); margin: 12px 0 0; font-size: 13px; line-height: 1.5; }
+  #speech-key-status { min-height: 20px; }
+  .key-actions { display: flex; gap: 8px; margin-top: 12px; }
+  .key-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  #speech-key { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 8px; flex: 1; min-width: 160px; }
   #interim { color: var(--muted); font-style: italic; }
   #committed { outline: none; caret-color: var(--accent); }
   mark.kw {
@@ -179,13 +192,11 @@
     <button class="tab" role="tab" id="tab-history" aria-selected="false" aria-controls="history">History</button>
     <button class="tab" role="tab" id="tab-intro" aria-selected="false" aria-controls="intro">Self Intro</button>
   </nav>
-  <!-- Purely decorative: no script, no microphone access, never records or transcribes anything. -->
-  <span class="mic-show" id="mic-show" role="img" aria-label="Decorative - not recording" title="Decorative - not recording">
-    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
-      <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/>
-    </svg>
-  </span>
   <div class="spacer"></div>
+  <button id="speech-settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="speech-settings-panel">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m9 3-1 3-3 1-2 3 2 2-1 3 3 2 3-1 2 3h3l1-3 3-1 2-3-2-2 1-3-3-2-3 1-2-3z"/><circle cx="12" cy="11" r="3"/></svg>
+    Settings
+  </button>
   <button id="fullscreen">Fullscreen</button>
   <span class="link" id="link" title="Connection to the app"><span class="dot"></span><span id="link-text">Connecting…</span></span>
   <span class="pill" id="pill" data-state="idle" role="status" aria-live="polite"><span class="dot"></span><span id="pill-text">Idle</span></span>
@@ -209,6 +220,11 @@
             <line class="slash-bg" x1="4" y1="4" x2="20" y2="20"/>
             <line class="slash" x1="4" y1="4" x2="20" y2="20"/>
           </svg>
+          <span>Free</span>
+        </button>
+        <button id="mic-paid" aria-pressed="false" title="Start Speechmatics using your paid credit">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11z"/></svg>
+          <span>Paid</span>
         </button>
         <select id="lang" aria-label="Speech language"></select>
         <span id="mic-note" class="mic-note" role="status" aria-live="polite"></span>
@@ -217,6 +233,10 @@
       <button id="copy">Copy</button>
       <button id="save" class="primary">Save to history</button>
       <button id="clear" class="danger">Clear</button>
+    </div>
+    <div class="speech-messages" aria-live="polite">
+      <p id="speech-error"></p><p id="speech-pending"></p>
+      <button id="speech-copy-pending" hidden>Copy pending text</button>
     </div>
     <div class="toolbar kw-bar" id="kw-bar" hidden>
       <input id="kw-input" type="text" placeholder="Add a keyword (one word)…" aria-label="Keyword to highlight" maxlength="40" autocomplete="off" spellcheck="false">
@@ -258,8 +278,27 @@
     </div>
   </section>
 </main>
+<dialog id="speech-settings-panel" aria-labelledby="speech-settings-title">
+  <div class="settings-heading">
+    <h2 id="speech-settings-title">Speech settings</h2>
+    <button id="speech-settings-close" aria-label="Close settings">×</button>
+  </div>
+  <label for="speech-key">Speechmatics API key</label>
+  <div class="key-controls">
+    <input id="speech-key" type="password" maxlength="4096" placeholder="Paste your API key" autocomplete="off" spellcheck="false" autofocus>
+  </div>
+  <div class="key-actions">
+    <button id="speech-key-save" class="primary">Save key</button>
+    <button id="speech-key-test">Test</button>
+    <button id="speech-key-remove">Remove</button>
+  </div>
+  <p id="speech-key-status" role="status">No key is needed for the free mic.</p>
+  <p>Your key stays saved on this laptop, including after code updates.</p>
+  <p>Speechmatics uses your account credit. The free mic needs no key.</p>
+</dialog>
 <div id="toast" role="status" aria-live="polite"></div>
 
+<script src="/board-speech.js"></script>
 <script>
 (function () {
   "use strict";
@@ -589,181 +628,17 @@
   });
   source.addEventListener("status", function (e) { setStatus(JSON.parse(e.data)); });
 
-  // ---- speech: the browser's built-in recognizer, finished phrases go to the app ----
-  var LANGS = [
-    ["English (India)", "en-IN"], ["English (US)", "en-US"], ["English (UK)", "en-GB"],
-    ["Hindi", "hi-IN"], ["Telugu", "te-IN"], ["Tamil", "ta-IN"],
-    ["Spanish", "es-ES"], ["French", "fr-FR"], ["German", "de-DE"]
-  ];
-  var langSelect = $("lang");
-  LANGS.forEach(function (l) {
-    var o = document.createElement("option");
-    o.value = l[1]; o.textContent = l[0];
-    langSelect.appendChild(o);
-  });
-  langSelect.value = LANGS.some(function (l) { return l[1] === prefs.lang; }) ? prefs.lang : "en-IN";
-  langSelect.addEventListener("change", function () {
-    prefs.lang = langSelect.value;
-    savePrefs();
-    if (listening) { restartRecognizer(); }
-  });
-
-  var micBtn = $("mic");
-  var micNote = $("mic-note");
-  var recog = null;
-  var listening = false;       // what the user asked for; the browser may stop on its own
-  var retryDelay = 250;        // grows while restarts keep failing, resets after a healthy session
-  var retryTimer = null;
-  var lastStart = 0;
-  var lastError = "";
-  // Chrome can stop producing results without ever firing onend or onerror,
-  // which leaves the mic showing "on" while nothing is listening. Any
-  // recognizer activity counts as a sign of life; going quiet for this long
-  // restarts the session instead of waiting for an event that may never come.
-  var STALL_MS = 25000;
-  var WATCHDOG_MS = 7000;
-  var lastActivity = 0;
-  var watchdogTimer = null;
-
-  // Looked up when used, not at load, so it can be swapped for a test double.
-  function getRecognizer() { return window.SpeechRecognition || window.webkitSpeechRecognition; }
-
-  function setInterim(text) {
-    var t = text.trim();
-    // Same spacing rule the app applies to finished phrases, so the words
-    // don't jump when they turn into real text.
-    var needsSpace = t && committed && !/\s$/.test(committed);
-    interimEl.textContent = t ? (needsSpace ? " " : "") + t : "";
-    followIfNeeded();
-  }
-  function setMicNote(text) { micNote.textContent = text || ""; }
-  function updateMic() {
-    var label = listening ? "Microphone on - click to turn off" : "Microphone off - click to turn on";
-    micBtn.classList.toggle("live", listening);
-    micBtn.setAttribute("aria-pressed", String(listening));
-    micBtn.setAttribute("aria-label", label);
-    micBtn.title = label;
-  }
-  function sendPhrase(text) {
-    text = text.trim();
-    if (!text) return;
-    fetch("/append" + location.search, {
-      method: "POST",
-      headers: { "X-Board": "1", "Content-Type": "application/json" },
-      body: JSON.stringify({ text: text })
-    }).then(function (r) {
-      if (!r.ok) throw new Error("bad status");
-    }).catch(function () { toast("Could not add spoken text - is the app running?"); });
-  }
-  function stopListening(message) {
-    listening = false;
-    clearTimeout(retryTimer);
-    clearTimeout(watchdogTimer);
-    if (recog) { try { recog.abort(); } catch (e) { /* already stopped */ } }
-    recog = null;
-    setInterim("");
-    setMicNote("");
-    updateMic();
-    if (message) toast(message);
-  }
-  // Listening stays on until the user turns it off. Only these mean it
-  // truly can't continue; everything else (silence, a dropped connection, the
-  // browser ending a long session) is retried, backing off up to 5 seconds.
-  var FATAL = {
-    "not-allowed": "Microphone is blocked - allow it in the address bar, then turn it on again",
-    "service-not-allowed": "Speech recognition is blocked in this browser",
-    "audio-capture": "No microphone found",
-    "language-not-supported": "This language isn't supported by the browser's speech service"
-  };
-  function scheduleRestart(mine) {
-    var delay = retryDelay;
-    retryDelay = Math.min(retryDelay * 2, 5000);
-    clearTimeout(retryTimer);
-    retryTimer = setTimeout(function () { if (listening && mine === recog) startRecognizer(); }, delay);
-  }
-  function touchActivity() { lastActivity = Date.now(); }
-  function watchdog() {
-    if (!listening) return;
-    if (Date.now() - lastActivity > STALL_MS) {
-      restartRecognizer();
-      setMicNote("Reconnecting…");
+  // Both speech engines share the board's existing rendering and history.
+  var speech = AnswerBoardSpeech.init({
+    $: $, prefs: prefs, savePrefs: savePrefs, toast: toast,
+    keywords: function () { return keywords.slice(); },
+    interim: function (text) {
+      var t = text.trim();
+      var needsSpace = t && committed && !/\s$/.test(committed);
+      interimEl.textContent = t ? (needsSpace ? " " : "") + t : "";
+      followIfNeeded();
     }
-    watchdogTimer = setTimeout(watchdog, WATCHDOG_MS);
-  }
-  function startRecognizer() {
-    var Rec = getRecognizer();
-    recog = new Rec();
-    recog.lang = langSelect.value;
-    recog.continuous = true;
-    recog.interimResults = true;
-    var mine = recog;
-    recog.onstart = function () { if (mine === recog) touchActivity(); };
-    recog.onresult = function (e) {
-      if (mine !== recog) return;
-      touchActivity();
-      retryDelay = 250;
-      setMicNote("");
-      var interim = "";
-      for (var i = e.resultIndex; i < e.results.length; i++) {
-        var r = e.results[i];
-        if (r.isFinal) { sendPhrase(r[0].transcript); } else { interim += r[0].transcript; }
-      }
-      setInterim(interim);
-    };
-    recog.onerror = function (e) {
-      if (mine !== recog) return;
-      if (FATAL[e.error]) { stopListening(FATAL[e.error]); return; }
-      lastError = e.error;              // soft: onend follows and restarts
-    };
-    recog.onend = function () {
-      if (mine !== recog) return;       // replaced or stopped on purpose
-      setInterim("");
-      if (!listening) return;
-      if (Date.now() - lastStart >= 2000 && lastError !== "network") {
-        retryDelay = 250;               // a normal end (silence timeout): carry straight on
-        setMicNote("");
-      } else {
-        setMicNote(lastError === "network" ? "No connection - retrying…" : "Reconnecting…");
-      }
-      lastError = "";
-      scheduleRestart(mine);
-    };
-    lastStart = Date.now();
-    try { recog.start(); } catch (e) { scheduleRestart(mine); }
-  }
-  function restartRecognizer() {
-    var old = recog;
-    recog = null;
-    clearTimeout(retryTimer);
-    retryDelay = 250;
-    setMicNote("");
-    if (old) { try { old.abort(); } catch (e) { /* already stopped */ } }
-    startRecognizer();
-  }
-  micBtn.addEventListener("click", function () {
-    if (listening) { stopListening(); return; }
-    if (!getRecognizer()) { toast("Speech needs Chrome or Edge"); return; }
-    listening = true;
-    retryDelay = 250;
-    updateMic();
-    touchActivity();
-    startRecognizer();
-    clearTimeout(watchdogTimer);
-    watchdogTimer = setTimeout(watchdog, WATCHDOG_MS);
   });
-  // Browsers often pause speech recognition while the tab is in the background
-  // or the connection drops; resume it as soon as the page is back.
-  document.addEventListener("visibilitychange", function () {
-    if (!document.hidden && listening) restartRecognizer();
-  });
-  window.addEventListener("online", function () {
-    if (listening) restartRecognizer();
-  });
-  if (!getRecognizer()) {
-    micBtn.title = "Speech recognition needs Chrome or Edge";
-    micBtn.disabled = true;
-    langSelect.disabled = true;
-  }
 
   // ---- copy / save / clear ----
   function copyText(text, doneMessage) {
@@ -809,6 +684,7 @@
     });
   }
   $("clear").addEventListener("click", function () {
+    if (speech.hasPending()) { toast("Wait for pending speech to reach the board before clearing"); return; }
     if (!committed) { toast("Nothing to clear"); return; }
     fetch("/clear" + location.search, { method: "POST", headers: { "X-Board": "1" } }).then(function (r) {
       if (!r.ok) throw new Error("bad status");

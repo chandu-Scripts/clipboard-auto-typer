@@ -118,7 +118,7 @@ def test_key_controls_and_reload(page, credentials, monkeypatch):
     assert not credentials.exists()
 
 
-@pytest.mark.parametrize("use_shortcuts", [False, True])
+@pytest.mark.parametrize("use_shortcuts", [False, True, "layout", "windows_layout"])
 def test_switch_to_paid_streams_pcm_and_finishes_before_free(page, monkeypatch, use_shortcuts):
     monkeypatch.setattr(speech_config, "create_token", lambda: {"token":"test-token", "url":speech_config.REALTIME_URL})
     messages, audio = [], []
@@ -140,7 +140,29 @@ def test_switch_to_paid_streams_pcm_and_finishes_before_free(page, monkeypatch, 
 
     page.route_web_socket("wss://eu.rt.speechmatics.com/**", websocket)
     def toggle(kind):
-        if use_shortcuts:
+        if use_shortcuts == "windows_layout":
+            # Flags captured from real Windows Ctrl+left Alt+O/M input:
+            # the letter reports only AltGraph, without ctrlKey or altKey.
+            page.evaluate("""kind => {
+                const send = (type, options) => document.dispatchEvent(new KeyboardEvent(type,
+                    {bubbles:true, cancelable:true, ...options}));
+                send('keydown', {key:'Control', code:'ControlLeft', ctrlKey:true});
+                send('keydown', {key:'Alt', code:'AltLeft', ctrlKey:true, altKey:true});
+                const letter = {code:kind === 'free' ? 'KeyO' : 'KeyM',
+                    key:kind === 'free' ? '\u014d' : '\u1e41', modifierAltGraph:true};
+                send('keydown', letter);
+                send('keyup', letter);
+                send('keyup', {key:'Alt', code:'AltLeft', ctrlKey:true});
+                send('keyup', {key:'Control', code:'ControlLeft'});
+            }""", kind)
+        elif use_shortcuts == "layout":
+            # Ctrl+Alt can change event.key on international keyboard layouts.
+            page.evaluate("""kind => document.dispatchEvent(new KeyboardEvent('keydown', {
+                code: kind === 'free' ? 'KeyO' : 'KeyM',
+                key: kind === 'free' ? '\u00f8' : '\u00b5',
+                ctrlKey: true, altKey: true, bubbles: true, cancelable: true
+            }))""", kind)
+        elif use_shortcuts:
             page.keyboard.press("Control+Alt+" + ("o" if kind == "free" else "m"))
         else:
             page.locator("#mic" if kind == "free" else "#mic-paid").click()
@@ -195,6 +217,30 @@ def test_mic_shortcut_while_editing_toggles_once_per_press(page, board_server):
     page.keyboard.press("Control+Alt+o")
     expect(page.locator("#mic-note")).to_have_text("Microphones off")
     expect(editor).to_have_text(text)
+
+
+def test_altgr_typing_and_lost_focus_do_not_toggle_mics(page):
+    assert page.evaluate("""() => {
+        const send = (type, options) => document.dispatchEvent(new KeyboardEvent(type,
+            {bubbles:true, cancelable:true, ...options}));
+        send('keydown', {key:'Control', code:'ControlLeft', ctrlKey:true});
+        send('keydown', {key:'AltGraph', code:'AltRight', modifierAltGraph:true});
+        const allowed = send('keydown', {key:'\u1e41', code:'KeyM', modifierAltGraph:true});
+        send('keyup', {key:'AltGraph', code:'AltRight'});
+        send('keyup', {key:'Control', code:'ControlLeft'});
+        return allowed;
+    }""")
+    # A modifier released outside the page must not leave a stuck shortcut.
+    assert page.evaluate("""() => {
+        const send = (options) => document.dispatchEvent(new KeyboardEvent('keydown',
+            {bubbles:true, cancelable:true, ...options}));
+        send({key:'Control', code:'ControlLeft', ctrlKey:true});
+        send({key:'Alt', code:'AltLeft', ctrlKey:true, altKey:true});
+        window.dispatchEvent(new Event('blur'));
+        return send({key:'o', code:'KeyO'});
+    }""")
+    expect(page.locator('#mic-note')).to_have_text('Microphones off')
+    assert page.evaluate('recognizers.length') == 0
 
 
 def test_missing_paid_key_returns_to_off(page, credentials):

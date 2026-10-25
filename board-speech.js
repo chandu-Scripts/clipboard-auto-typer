@@ -399,11 +399,28 @@
     }
     buttons.free.addEventListener("click",function () { choose("free"); });
     buttons.paid.addEventListener("click",function () { choose("paid"); });
+    var heldModifiers = new Set();
+    function trackModifier(event) {
+      if (["ControlLeft", "ControlRight", "AltLeft"].indexOf(event.code) === -1) return;
+      if (event.type === "keydown") heldModifiers.add(event.code);
+      else heldModifiers.delete(event.code);
+    }
+    document.addEventListener("keyup", trackModifier);
+    window.addEventListener("blur", function () { heldModifiers.clear(); });
     document.addEventListener("keydown", function (event) {
-      if (!event.ctrlKey || !event.altKey || event.shiftKey || event.metaKey ||
-          event.isComposing || event.getModifierState("AltGraph")) return;
+      trackModifier(event);
+      // Some Windows layouts report Ctrl+left Alt+letter as AltGraph, clearing
+      // ctrlKey/altKey on the letter event. Remember the physical modifiers.
+      // Requiring left Alt for that fallback leaves ordinary AltGr typing alone.
+      var physicalChord = heldModifiers.has("AltLeft") &&
+        (heldModifiers.has("ControlLeft") || heldModifiers.has("ControlRight"));
+      var reportedChord = event.ctrlKey && event.altKey && !event.getModifierState("AltGraph");
+      if (!(physicalChord || reportedChord) || event.shiftKey || event.metaKey || event.isComposing) return;
       var key = event.key.toLowerCase();
-      var kind = key === "o" ? "free" : key === "m" ? "paid" : null;
+      // Ctrl+Alt may turn event.key into a different character (for example
+      // a symbol). Recognize the physical O/M keys as well as their letters.
+      var kind = event.code === "KeyO" ? "free" : event.code === "KeyM" ? "paid" :
+        key === "o" ? "free" : key === "m" ? "paid" : null;
       if (!kind) return;
       event.preventDefault();
       // Holding a shortcut toggles only once; disabled buttons stay unavailable.

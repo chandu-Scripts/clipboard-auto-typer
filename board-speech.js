@@ -310,6 +310,9 @@
     if (!Array.isArray(drafts)) drafts = [];
     drafts = drafts.filter(function (text) { return typeof text === "string"; });
     var buttons = {free:$("mic"), paid:$("mic-paid")};
+    var shortcuts = {free:"Ctrl + Alt + O", paid:"Ctrl + Alt + M"};
+    buttons.free.setAttribute("aria-keyshortcuts", "Control+Alt+O");
+    buttons.paid.setAttribute("aria-keyshortcuts", "Control+Alt+M");
     var note = $("mic-note"), errorNote = $("speech-error");
     var deliveryMessage = "Reconnecting to the board… Your text will sync automatically.";
     var lang = $("lang"), local = ["localhost","127.0.0.1","[::1]"].indexOf(location.hostname) !== -1;
@@ -333,6 +336,7 @@
         buttons[kind].setAttribute("aria-label", (kind === "free" ? "Free microphone" : "Speechmatics paid microphone") + (active === kind ? " - stop" : " - start"));
         buttons[kind].disabled = busy || !secure || (kind === "free" ? !Rec : !local || !navigator.mediaDevices || !window.AudioWorkletNode);
         buttons[kind].title = active === kind ? "Stop and finish this transcript" : "Start " + (kind === "paid" ? "Speechmatics (uses your paid credit)" : "free browser recognition");
+        buttons[kind].title += " (" + shortcuts[kind] + ")";
       });
       lang.disabled = Boolean(active) || busy;
     }
@@ -395,6 +399,16 @@
     }
     buttons.free.addEventListener("click",function () { choose("free"); });
     buttons.paid.addEventListener("click",function () { choose("paid"); });
+    document.addEventListener("keydown", function (event) {
+      if (!event.ctrlKey || !event.altKey || event.shiftKey || event.metaKey ||
+          event.isComposing || event.getModifierState("AltGraph")) return;
+      var key = event.key.toLowerCase();
+      var kind = key === "o" ? "free" : key === "m" ? "paid" : null;
+      if (!kind) return;
+      event.preventDefault();
+      // Holding a shortcut toggles only once; disabled buttons stay unavailable.
+      if (!event.repeat) buttons[kind].click();
+    });
     window.addEventListener("online",queue.retry);
     window.addEventListener("beforeunload",function (event) {
       if (active || queue.count() || interim.trim()) { event.preventDefault(); event.returnValue=""; }

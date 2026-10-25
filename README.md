@@ -93,6 +93,8 @@ Click **Open Answer Board** (or browse to `http://localhost:8766/`). The page:
 
 Open **http://localhost:8766/** on the laptop running the app, then allow microphone access.
 
+With the Answer Board focused, press **Ctrl+Alt+O** to toggle the **Free** mic or **Ctrl+Alt+M** to toggle the **Paid** mic. Press the same shortcut again to mute. Switching microphones finishes the current transcript before starting the other mic. Holding the keys toggles only once. These shortcuts also work while editing board text; they are not global shortcuts for other apps.
+
 | Button | Recognition | Setup |
 |---|---|---|
 | **Free mic** | Browser speech recognition in a supported browser such as Chrome or Edge | No API key or API bill; generally needs internet. Accuracy depends on the browser service. |

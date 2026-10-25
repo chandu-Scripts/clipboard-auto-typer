@@ -80,8 +80,8 @@
   @keyframes pulse { 50% { opacity: .35; transform: scale(.8); } }
   @media (prefers-reduced-motion: reduce) { .pill[data-state="typing"] .dot { animation: none; } }
 
-  main { min-height: 0; display: grid; }
-  section { min-height: 0; display: none; }
+  main { min-height: 0; min-width: 0; display: grid; }
+  section { min-height: 0; min-width: 0; display: none; }
   section.active { display: grid; }
 
   #live, #intro { grid-template-rows: auto 1fr; }
@@ -95,7 +95,7 @@
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
     padding: 10px 18px; border-bottom: 1px solid var(--line);
   }
-  .group { display: inline-flex; align-items: center; gap: 4px; }
+  .group { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; max-width: 100%; }
   .size { min-width: 52px; text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
   select { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
 
@@ -149,13 +149,16 @@
 
   .reader { position: relative; min-height: 0; }
   #text {
-    position: absolute; inset: 0; overflow: auto;
-    padding: 24px 18px;
+    position: absolute; inset: 0; width: min(100%, 920px); margin-inline: auto;
+    overflow-y: auto; overflow-x: hidden;
+    scrollbar-gutter: stable both-edges; scrollbar-color: #51596b var(--bg);
+    overscroll-behavior-y: contain;
+    padding: 32px 24px max(80px, calc(var(--reader-height, 0px) - 32px - 1lh));
     white-space: pre-wrap; overflow-wrap: anywhere;
-    line-height: 1.55;
+    line-height: 1.55; text-align: left;
   }
   #jump {
-    position: absolute; right: 22px; bottom: 18px; display: none;
+    position: absolute; right: max(22px, calc((100% - 920px) / 2 + 22px)); bottom: 18px; display: none;
     box-shadow: 0 6px 20px rgba(0,0,0,.4);
   }
   #jump.show { display: block; }
@@ -394,7 +397,19 @@
   });
   textEl.addEventListener("mousedown", function (e) {
     // Clicking the empty space below the text starts typing at the end.
-    if (e.target === textEl) { committedEl.focus(); insertAtCaret(""); }
+    // Leave the scrollbar and its gutters alone so dragging never moves the caret.
+    var contentLeft = textEl.getBoundingClientRect().left + textEl.clientLeft;
+    if (e.button === 0 && e.target === textEl && e.clientX >= contentLeft && e.clientX < contentLeft + textEl.clientWidth) {
+      e.preventDefault();
+      committedEl.focus({ preventScroll: true });
+      // Move the caret without replacing or deleting the existing selection.
+      var end = document.createRange();
+      end.selectNodeContents(committedEl);
+      end.collapse(false);
+      var selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(end);
+    }
   });
   function addPlain(s) {
     var last = committedEl.lastChild;
@@ -432,8 +447,14 @@
   var following = true;
   var scrollQueued = false;
 
+  function latestScrollTop() {
+    // Leave the extra reading space available for manual scrolling, while
+    // automatic following keeps the newest lines near the bottom as before.
+    var tail = parseFloat(getComputedStyle(textEl).paddingBottom);
+    return Math.max(0, textEl.scrollHeight - textEl.clientHeight - tail + 80);
+  }
   function atBottom() {
-    return textEl.scrollHeight - textEl.scrollTop - textEl.clientHeight <= 48;
+    return Math.abs(latestScrollTop() - textEl.scrollTop) <= 4;
   }
   function updateJump() {
     $("jump").classList.toggle("show", !following && committed.length > 0);
@@ -443,19 +464,28 @@
     scrollQueued = true;
     requestAnimationFrame(function () {
       scrollQueued = false;
-      textEl.scrollTop = textEl.scrollHeight;
+      // A user may have scrolled up after this frame was scheduled.
+      if (!following || !$("live").classList.contains("active")) return;
+      textEl.scrollTop = latestScrollTop();
     });
   }
+  textEl.addEventListener("wheel", function (e) {
+    if (e.deltaY !== 0) { following = false; updateJump(); }
+  }, { passive: true });
   textEl.addEventListener("scroll", function () {
-    // Scrolling up stops the auto-follow; reaching the bottom again resumes it.
+    // Manual scrolling above or below the latest-text position pauses following.
     following = atBottom();
     updateJump();
   });
   $("jump").addEventListener("click", function () {
     following = true;
-    textEl.scrollTop = textEl.scrollHeight;
+    textEl.scrollTop = latestScrollTop();
     updateJump();
   });
+  new ResizeObserver(function () {
+    textEl.style.setProperty("--reader-height", textEl.parentElement.clientHeight + "px");
+    followIfNeeded();
+  }).observe(textEl.parentElement);
 
   // ---- preferences: text size + font ----
   var prefs = load(PREFS_KEY, {});
@@ -782,7 +812,7 @@
       $(v).classList.toggle("active", on);
       $("tab-" + v).setAttribute("aria-selected", String(on));
     });
-    if (view === "live") { if (following) { textEl.scrollTop = textEl.scrollHeight; } }
+    if (view === "live") { if (following) { textEl.scrollTop = latestScrollTop(); } }
     else if (view === "history") { renderHistory(); }
     else { introEl.focus(); }   // ready to paste
   }

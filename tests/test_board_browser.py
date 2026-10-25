@@ -118,7 +118,8 @@ def test_key_controls_and_reload(page, credentials, monkeypatch):
     assert not credentials.exists()
 
 
-def test_switch_to_paid_streams_pcm_and_finishes_before_free(page, monkeypatch):
+@pytest.mark.parametrize("use_shortcuts", [False, True])
+def test_switch_to_paid_streams_pcm_and_finishes_before_free(page, monkeypatch, use_shortcuts):
     monkeypatch.setattr(speech_config, "create_token", lambda: {"token":"test-token", "url":speech_config.REALTIME_URL})
     messages, audio = [], []
 
@@ -138,10 +139,16 @@ def test_switch_to_paid_streams_pcm_and_finishes_before_free(page, monkeypatch):
         ws.on_message(receive)
 
     page.route_web_socket("wss://eu.rt.speechmatics.com/**", websocket)
-    page.locator("#mic").click()
+    def toggle(kind):
+        if use_shortcuts:
+            page.keyboard.press("Control+Alt+" + ("o" if kind == "free" else "m"))
+        else:
+            page.locator("#mic" if kind == "free" else "#mic-paid").click()
+
+    toggle("free")
     expect(page.locator("#mic-note")).to_have_text("Listening · Free")
     page.evaluate("recognizers[0].tail='free final'")
-    page.locator("#mic-paid").click()
+    toggle("paid")
     expect(page.locator("#mic-note")).to_have_text("Listening · Speechmatics (paid)")
     expect(page.locator("#committed")).to_have_text("free final")
     expect(page.locator("#interim")).to_have_text("paid preview")
@@ -149,14 +156,45 @@ def test_switch_to_paid_streams_pcm_and_finishes_before_free(page, monkeypatch):
     assert messages[0]["transcription_config"]["model"] == "enhanced"
     # Actual AudioWorklet / fake-device capture, not a mocked PCM encoder.
     page.wait_for_timeout(250)
-    page.locator("#mic").click()
+    toggle("free")
     expect(page.locator("#mic-note")).to_have_text("Listening · Free")
     expect(page.locator("#committed")).to_have_text("free final paid final")
     assert audio
     assert messages[-1] == {"message":"EndOfStream", "last_seq_no":len(audio)}
     assert all(len(chunk) % 2 == 0 for chunk in audio)
     assert page.evaluate("recognizers.length") == 2
-    page.locator("#mic").click()
+    toggle("free")
+    expect(page.locator("#mic-note")).to_have_text("Microphones off")
+    toggle("paid")
+    expect(page.locator("#mic-paid")).to_have_attribute("aria-pressed", "true")
+    expect(page.locator("#mic-paid")).to_be_enabled()
+    toggle("paid")
+    expect(page.locator("#mic-note")).to_have_text("Microphones off")
+
+
+def test_mic_shortcut_while_editing_toggles_once_per_press(page, board_server):
+    server, _ = board_server
+    text = "Keep the selected answer unchanged."
+    server.hub.append(text)
+    editor = page.locator("#committed")
+    expect(editor).to_have_text(text)
+    editor.focus()
+    page.keyboard.press("Control+a")
+    page.keyboard.down("Control")
+    page.keyboard.down("Alt")
+    page.keyboard.down("o")
+    expect(page.locator("#mic-note")).to_have_text("Listening · Free")
+    page.keyboard.down("o")  # Native repeated keydown while the key is held.
+    page.keyboard.up("o")
+    page.keyboard.up("Alt")
+    page.keyboard.up("Control")
+    expect(page.locator("#mic-note")).to_have_text("Listening · Free")
+    expect(editor).to_have_text(text)
+    assert page.evaluate("window.getSelection().toString()") == text
+    assert page.evaluate("recognizers.length") == 1
+    page.keyboard.press("Control+Alt+o")
+    expect(page.locator("#mic-note")).to_have_text("Microphones off")
+    expect(editor).to_have_text(text)
 
 
 def test_missing_paid_key_returns_to_off(page, credentials):
@@ -247,6 +285,97 @@ def test_stop_without_final_result_keeps_words_on_board_once(page):
     page.locator("#mic").click()
     expect(page.locator("#mic-note")).to_have_text("Microphones off")
     expect(page.locator("#committed")).to_have_text("last recognized words")
+
+
+@pytest.mark.parametrize("edit_key", ["Backspace", "Delete", "x"])
+def test_clicking_blank_space_preserves_selected_text(page, board_server, edit_key):
+    server, _ = board_server
+    paragraph = "First selected line.\nSecond selected line."
+    text = paragraph + "\nKeep this last line."
+    server.hub.append(text)
+    editor = page.locator("#committed")
+    expect(editor).to_have_text(text)
+
+    def select_paragraph():
+        editor.evaluate("""(el, length) => {
+            el.focus();
+            const range = document.createRange();
+            range.setStart(el.firstChild, 0);
+            range.setEnd(el.firstChild, length);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }""", len(paragraph))
+        assert page.evaluate("window.getSelection().toString()") == paragraph
+
+    select_paragraph()
+    board = page.locator("#text").bounding_box()
+    page.mouse.click(board["x"] + board["width"] / 2, board["y"] + board["height"] - 40)
+    expect(editor).to_have_text(text)
+    assert page.evaluate("window.getSelection().isCollapsed")
+    page.keyboard.type(" More text.")
+    expect(editor).to_have_text(text + " More text.")
+
+    select_paragraph()
+    page.keyboard.press(edit_key)
+    replacement = "x" if edit_key == "x" else ""
+    expect(editor).to_have_text(replacement + "\nKeep this last line. More text.")
+
+
+@pytest.mark.parametrize("width,height,enlarge", [(1366, 900, False), (768, 600, False), (1366, 900, True)])
+def test_last_paragraph_can_scroll_to_top(page, board_server, width, height, enlarge):
+    page.set_viewport_size({"width": width, "height": height})
+    if enlarge:
+        for _ in range(8):
+            page.locator("#bigger").click()
+    server, _ = board_server
+    earlier = "Earlier paragraph with some transcript text.\n\n" * 24
+    last = "Final paragraph. " + "More words on the final paragraph. " * 8
+    server.hub.append(earlier + last)
+    expect(page.locator("#committed")).to_have_text(earlier + last)
+    page.wait_for_timeout(200)
+
+    def paragraph_offset():
+        return page.locator("#committed").evaluate("""(el, offset) => {
+            const range = document.createRange();
+            range.setStart(el.firstChild, offset);
+            range.setEnd(el.firstChild, offset + 1);
+            return range.getBoundingClientRect().top - document.getElementById('text').getBoundingClientRect().top;
+        }""", len(earlier))
+
+    board = page.locator("#text")
+    bounds = board.bounding_box()
+    assert bounds["y"] + bounds["height"] <= height + 1
+    board.hover()
+    page.mouse.wheel(0, paragraph_offset() - 32)
+    page.wait_for_timeout(300)
+    assert abs(paragraph_offset() - 32) <= 3
+    expect(page.locator("#jump")).to_be_visible()
+    reading_position = board.evaluate("el => el.scrollTop")
+    server.hub.append("\nA newer paragraph has arrived.")
+    expect(page.locator("#committed")).to_contain_text("A newer paragraph has arrived.")
+    page.wait_for_timeout(100)
+    assert abs(board.evaluate("el => el.scrollTop") - reading_position) <= 1
+
+    page.locator("#jump").click()
+    expect(page.locator("#jump")).to_be_hidden()
+    assert board.evaluate("""el => Math.abs(el.scrollTop - Math.max(0,
+        el.scrollHeight - el.clientHeight - parseFloat(getComputedStyle(el).paddingBottom) + 80))""") <= 4
+    # At the end of the full scroll range, the final line remains visible near
+    # the top rather than leaving the reader looking at a blank viewport.
+    board.hover()
+    page.mouse.wheel(0, 100000)
+    page.wait_for_timeout(300)
+    line_top = page.locator("#committed").evaluate("""el => {
+        const node = el.lastChild;
+        const range = document.createRange();
+        range.setStart(node, node.length - 1);
+        range.setEnd(node, node.length);
+        return range.getBoundingClientRect().top - document.getElementById('text').getBoundingClientRect().top;
+    }""")
+    assert 20 <= line_top <= 55, board.evaluate("""el => ({height:el.clientHeight,
+        scroll:el.scrollTop, total:el.scrollHeight, padding:getComputedStyle(el).paddingBottom,
+        line:getComputedStyle(el).lineHeight, reader:el.style.getPropertyValue('--reader-height')})""")
 
 
 def test_board_layout(page, tmp_path):

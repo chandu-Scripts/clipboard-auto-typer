@@ -93,7 +93,7 @@ Click **Open Answer Board** (or browse to `http://localhost:8766/`). The page:
 
 Open **http://localhost:8766/** on the laptop running the app, then allow microphone access.
 
-With the Answer Board focused, press **Ctrl+Alt+O** to toggle the **Free** mic or **Ctrl+Alt+M** to toggle the **Paid** mic. Press the same shortcut again to mute. Switching microphones finishes the current transcript before starting the other mic. Holding the keys toggles only once. These shortcuts also work while editing board text; they are not global shortcuts for other apps.
+With the receiving laptop's Answer Board focused, press **Ctrl+Alt+O** to toggle the **Free** mic or **Ctrl+Alt+M** to toggle the **Paid** mic. Use left Alt on Windows layouts that map Ctrl+Alt to special characters. Press the same shortcut again to mute. Switching microphones finishes the current transcript before starting the other mic. Holding the keys toggles only once. These local shortcuts also work while editing board text.
 
 | Button | Recognition | Setup |
 |---|---|---|
@@ -113,6 +113,8 @@ The free engine retries when its recognition session ends. A paid connection fai
 Spoken text goes to the board only, never into Word. Copy, Save to history, Clear, and History work with finalized speech just like typed text.
 
 **Two laptops:** the receiver's board is also viewable through its secret-protected LAN link. Microphone capture and Speechmatics key management are available on the local `localhost` board, not the ordinary HTTP LAN page. Each person who runs their own copy of the app can save their own key. With **Both** output, the Answer Board's browser window also counts as focused for Word typing; with **Web page** only, typing does not require Word focus.
+
+**Control the receiver's mic from the sender:** update and restart the app on both laptops. On the receiver, enable its remote trigger, open the localhost Answer Board, and choose **Settings → Enable remote mic control**. Allow microphone access and keep that tab open. Only one local tab can enable remote control at a time; after a page reload or connection interruption, enable it again. On the sender, use **Sends** mode, configure the existing LAN or Internet Relay connection, and enable **Send Clipboard to Remote Laptop**. **Ctrl+Alt+O** and **Ctrl+Alt+M** then control the receiver's Free and Paid microphones from any app on the sending laptop. Commands run when the letter key is released. The receiver's own buttons and shortcuts still work. Audio capture and the Speechmatics key stay on the receiver. No key is needed on the sender. Commands are authenticated with the existing shared secret, deduplicated, and expire after 30 seconds; keep the laptops' clocks synchronized. The sender reports command delivery, while the receiver's board shows whether its microphone actually started.
 
 ### Development checks
 

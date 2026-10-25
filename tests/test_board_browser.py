@@ -3,13 +3,17 @@
 No real API key, paid service, clipboard monitor, Word, or microphone is used.
 """
 import json
+import time
+import uuid
 from pathlib import Path
 
 import pytest
+import requests
 from playwright.sync_api import sync_playwright, expect
 
 import speech_config
 from test_speech import board_server, credentials  # shared isolated fixtures
+from test_remote_mic import lan_mic_receiver
 
 
 FAKE_RECOGNITION = """
@@ -422,6 +426,75 @@ def test_last_paragraph_can_scroll_to_top(page, board_server, width, height, enl
     assert 20 <= line_top <= 55, board.evaluate("""el => ({height:el.clientHeight,
         scroll:el.scrollTop, total:el.scrollHeight, padding:getComputedStyle(el).paddingBottom,
         line:getComputedStyle(el).lineHeight, reader:el.style.getPropertyValue('--reader-height')})""")
+
+
+def test_sender_controls_only_enabled_receiver_tab(page, lan_mic_receiver, monkeypatch):
+    _, lan_url = lan_mic_receiver
+    monkeypatch.setattr(speech_config, "create_token", lambda: {"token":"test-token", "url":speech_config.REALTIME_URL})
+    def websocket(ws):
+        def receive(data):
+            if not isinstance(data, str):
+                return
+            kind = json.loads(data)["message"]
+            if kind == "StartRecognition":
+                ws.send(json.dumps({"message":"RecognitionStarted", "id":"remote-test"}))
+            elif kind == "EndOfStream":
+                ws.send(json.dumps({"message":"EndOfTranscript"}))
+        ws.on_message(receive)
+    page.route_web_socket("wss://eu.rt.speechmatics.com/**", websocket)
+    page.locator("#speech-settings").click()
+    page.locator("#remote-mic-enable").click()
+    expect(page.locator("#remote-mic-enable")).to_have_attribute("aria-pressed", "true")
+    page.locator("#speech-settings-close").click()
+
+    other = page.context.new_page()
+    other.goto(page.url)
+    expect(other.locator("#link-text")).to_have_text("Connected")
+    other.locator("#speech-settings").click()
+    other.locator("#remote-mic-enable").click()
+    expect(other.locator("#remote-mic-status")).to_contain_text("another Answer Board tab")
+    expect(other.locator("#remote-mic-enable")).to_have_attribute("aria-pressed", "false")
+
+    def remote(engine):
+        payload = {"kind":"mic-toggle", "engine":engine, "id":str(uuid.uuid4()),
+                   "sent_at":time.time(), "secret":"test-shared-secret"}
+        assert requests.post(lan_url, json=payload).json()["mic_command"] == "queued"
+        return payload
+
+    # The receiving tab need not be focused; its microphone is used.
+    payload = remote("paid")
+    expect(page.locator("#mic-note")).to_contain_text("Listening")
+    expect(page.locator("#mic-paid")).to_have_attribute("aria-pressed", "true")
+    expect(page.locator("#mic")).to_be_enabled()
+    assert requests.post(lan_url, json=payload).json()["mic_command"] == "duplicate"
+    expect(page.locator("#mic-paid")).to_have_attribute("aria-pressed", "true")
+    expect(other.locator("#mic-note")).to_have_text("Microphones off")
+    assert other.evaluate("recognizers.length") == 0
+
+    page.keyboard.press("Control+Alt+o")
+    expect(page.locator("#mic-note")).to_have_text("Listening · Free")
+    remote("free")
+    expect(page.locator("#mic-note")).to_have_text("Microphones off")
+    remote("free")
+    expect(page.locator("#mic-note")).to_have_text("Listening · Free")
+    remote("paid")
+    expect(page.locator("#mic-paid")).to_have_attribute("aria-pressed", "true")
+    expect(page.locator("#mic")).to_be_enabled()
+    remote("paid")
+    expect(page.locator("#mic-note")).to_have_text("Microphones off")
+    page.locator("#speech-settings").click()
+    page.locator("#remote-mic-enable").click()
+    expect(page.locator("#remote-mic-enable")).to_have_attribute("aria-pressed", "false")
+    assert requests.post(lan_url, json={**payload, "id":str(uuid.uuid4())}).status_code == 409
+    other.close()
+
+
+def test_read_only_board_loads_without_secure_context_uuid(page, board_server):
+    page.add_init_script("Object.defineProperty(window.crypto, 'randomUUID', {value:undefined});")
+    page.reload()
+    expect(page.locator("#link-text")).to_have_text("Connected")
+    board_server[0].hub.append("The LAN reader still works.")
+    expect(page.locator("#committed")).to_have_text("The LAN reader still works.")
 
 
 def test_board_layout(page, tmp_path):

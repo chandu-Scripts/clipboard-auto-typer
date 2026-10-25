@@ -12,6 +12,7 @@ import time
 import tkinter as tk
 import traceback
 import webbrowser
+import uuid
 from collections import OrderedDict
 from tkinter import filedialog
 from urllib.parse import parse_qs, urlsplit
@@ -28,6 +29,7 @@ import win32gui
 import win32process
 from PIL import Image, ImageDraw
 import speech_config
+from remote_mic import RemoteMicControls
 
 CLIPBOARD_POLL_SECONDS = 0.15
 # Some apps (the VS Code terminal's copy-on-select, for one) copy continuously
@@ -395,6 +397,7 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
         # the Tk main thread via root.after(), so it may not have actually
         # run yet by the time this response goes out.
         reported_paused = app.paused
+        mic_result = {}
         if kind == "text":
             text = payload.get("text", "")
             if text:
@@ -408,6 +411,17 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
                 # which surfaces as a ConnectionResetError on end_headers()
                 # below even though the text was already on its way to Word.
                 threading.Thread(target=self._start_typing, args=(app, text), daemon=True).start()
+        elif kind == "mic-toggle":
+            try:
+                mic_result = app.receive_mic_command(payload)
+            except ValueError as exc:
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
         elif kind in ("pause", "resume"):
             should_pause = kind == "pause"
             # Always handed to the Tk thread, which applies them in order;
@@ -424,7 +438,7 @@ class LANRequestHandler(http.server.BaseHTTPRequestHandler):
                 app.root.after(0, lambda sp=should_pause: app.remote_set_paused(sp))
                 reported_paused = should_pause
             # else: nothing will change - reported_paused stays app.paused
-        response_body = json.dumps({"paused": reported_paused}).encode("utf-8")
+        response_body = json.dumps({"paused": reported_paused, **mic_result}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response_body)))
@@ -453,6 +467,7 @@ class BoardHub:
         self._status = {"state": "idle", "done": 0, "total": 0}
         self._subscribers = []
         self._spoken_ids = OrderedDict()
+        self.remote_mic = RemoteMicControls()
 
     def has_text(self):
         with self._lock:
@@ -516,6 +531,7 @@ class BoardHub:
             return q, self._snapshot_locked()
 
     def unsubscribe(self, q):
+        self.remote_mic.disconnect(q)
         with self._lock:
             if q in self._subscribers:
                 self._subscribers.remove(q)
@@ -663,7 +679,7 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._reply(204)
         elif path == "/append":
             self._append_spoken()
-        elif path in ("/speech/settings", "/speech/token"):
+        elif path in ("/speech/settings", "/speech/token", "/speech/control"):
             if self._speech_local_only():
                 self._speech_request(path)
         else:
@@ -722,7 +738,12 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._json_reply(400, {"error": "Invalid settings request."})
             return
         try:
-            if path == "/speech/token":
+            if path == "/speech/control":
+                if not isinstance(data.get("enabled"), bool):
+                    raise ValueError("Specify whether remote mic control is enabled.")
+                result = self.server.hub.remote_mic.configure(data.get("client"), data["enabled"])
+                self._json_reply(200, result)
+            elif path == "/speech/token":
                 self._json_reply(200, speech_config.create_token())
             elif data.get("action") == "save":
                 speech_config.save_key(data.get("key"))
@@ -737,6 +758,8 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._json_reply(400, {"error": "Unknown settings action."})
         except speech_config.SpeechConfigError as exc:
             self._json_reply(400, {"error": str(exc)})
+        except ValueError as exc:
+            self._json_reply(409, {"error": str(exc)})
 
     def _send_event(self, event, data):
         payload = json.dumps(data)  # one line: json escapes newlines
@@ -746,6 +769,9 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
     def _stream(self):
         hub = self.server.hub
         q, snapshot = hub.subscribe()
+        if self.client_address[0] in ("127.0.0.1", "::1"):
+            client = parse_qs(urlsplit(self.path).query).get("client", [None])[0]
+            hub.remote_mic.connect(client, q)
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1204,6 +1230,8 @@ class App:
         # passive Relay: status settle on its own timer.
         self.test_connection_btn = tk.Button(send_remote_frame, text="Test Connection", command=self.test_connection)
         self.test_connection_btn.pack(side="left", padx=(6, 0))
+        tk.Label(self.send_container, text="Receiver mic hotkeys: Ctrl+Alt+O (Free) | Ctrl+Alt+M (Paid)",
+                 fg="gray", anchor="w").pack(fill="x", padx=10, pady=(0, 4))
         self.relay_status_label = tk.Label(self.send_container, text="Relay: Off", fg="gray", anchor="w")
         self.relay_status_label.pack(fill="x", padx=10, pady=(0, 6))
 
@@ -1264,6 +1292,9 @@ class App:
         self.hotkey_lock = threading.Lock()
         self.hotkey_last_event = 0.0
         self.hotkey_seq = 0
+        self.mic_hotkeys = []
+        self.mic_commands = queue.Queue(maxsize=32)
+        threading.Thread(target=self._mic_command_worker, daemon=True).start()
         # Sender side: presses are turned into "set the receiver to X"
         # messages sent in order by one worker (see request_remote_pause).
         self.pause_lock = threading.Lock()
@@ -1309,6 +1340,7 @@ class App:
         self.root.focus_force()
 
     def exit_app(self, icon=None, item=None):
+        self.configure_mic_hotkeys("type")
         self.stop_remote_watch()  # closes the LAN server socket cleanly, if one was open
         if self.tray_icon is not None:
             self.tray_icon.stop()
@@ -1401,6 +1433,7 @@ class App:
 
     def on_mode_change(self):
         mode = self.mode_var.get()
+        self.configure_mic_hotkeys(mode)
         if mode == "type":
             self.stop_send_clipboard_remote()
             self.send_container.pack_forget()
@@ -1459,6 +1492,75 @@ class App:
         self.send_remote_btn.config(text="Send Clipboard to Remote Laptop")
 
     # ---- pause/stop controls ----
+
+    def configure_mic_hotkeys(self, mode):
+        for remove in self.mic_hotkeys:
+            remove()
+        self.mic_hotkeys = []
+        if mode == "send":
+            for keys, engine in (("ctrl+alt+o", "free"), ("ctrl+alt+m", "paid")):
+                remove = keyboard.add_hotkey(keys,
+                    lambda engine=engine: self.root.after(0, self.send_mic_hotkey, engine),
+                    suppress=True, trigger_on_release=True)
+                self.mic_hotkeys.append(remove)
+
+    def send_mic_hotkey(self, engine):
+        if self.mode_var.get() != "send":
+            return
+        if not self.remote_config or not self.send_clipboard_remote_enabled:
+            self.on_status("Enable 'Send Clipboard to Remote Laptop' before using remote mic hotkeys.")
+            return
+        if self.connection_type_var.get() == "lan":
+            ip = self.lan_receiver_ip_var.get().strip()
+            if not ip:
+                self.on_status("Enter the receiving laptop's LAN IP address first.")
+                return
+            url = f"http://{ip}:{self.remote_config.get('lan_port', LAN_DEFAULT_PORT)}/"
+            relay = False
+        else:
+            url = f"{NTFY_BASE_URL}/{self.remote_config['topic']}"
+            relay = True
+        payload = {"kind": "mic-toggle", "engine": engine, "id": str(uuid.uuid4()),
+                   "sent_at": time.time(), "secret": self.remote_config["secret"]}
+        try:
+            self.mic_commands.put_nowait((url, relay, payload))
+        except queue.Full:
+            self.on_status("Too many pending mic commands. Wait for the connection and try again.")
+
+    def _mic_command_worker(self):
+        while True:
+            url, relay, payload = self.mic_commands.get()
+            try:
+                if time.time() - payload["sent_at"] > 30:
+                    self.on_status("Remote mic command expired; press the shortcut again.")
+                    continue
+                response = requests.post(url, data=json.dumps(payload),
+                    headers={"Content-Type": "text/plain"}, timeout=10)
+                if response.status_code != 200:
+                    if not relay:
+                        try:
+                            message = response.json().get("error", "Receiver rejected the mic command.")
+                        except ValueError:
+                            message = "Receiver rejected the mic command. Update both laptops."
+                        self.on_status(message)
+                    else:
+                        self.on_status("Relay rejected the mic command. Check the connection.")
+                    continue
+                if not relay and response.json().get("mic_command") not in ("queued", "duplicate"):
+                    self.on_status("Update the receiving laptop to support remote mic controls.")
+                    continue
+                self.on_status(f"Sent {payload['engine']} mic toggle to receiving laptop.")
+            except Exception:
+                self.on_status("Could not deliver the mic command. Check the connection before trying again.")
+            finally:
+                self.mic_commands.task_done()
+
+    def receive_mic_command(self, payload):
+        if not self.remote_watch_enabled or self.mode_var.get() != "type":
+            raise ValueError("Enable the remote trigger on the receiving laptop first.")
+        result = self.board.remote_mic.submit(payload)
+        self.on_status(f"Received {payload['engine']} mic toggle for the Answer Board.")
+        return result
 
     def on_pause_hotkey(self):
         """Called for every hotkey press event, including the OS's
@@ -1944,6 +2046,12 @@ class App:
                         if payload.get("secret") != secret:
                             continue
                         kind = payload.get("kind", "text")
+                        if kind == "mic-toggle":
+                            try:
+                                self.receive_mic_command(payload)
+                            except ValueError as exc:
+                                self.on_status(str(exc))
+                            continue
                         if kind == "heartbeat":
                             if payload.get("role") == "send":
                                 self.type_last_peer_heartbeat = time.time()

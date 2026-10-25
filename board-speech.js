@@ -361,7 +361,12 @@
     drafts.forEach(keepDraft);
     try { sessionStorage.removeItem("answerboard.speech-drafts.v1"); } catch (_) { /* storage unavailable */ }
     drafts = [];
-    async function choose(kind) {
+    var transitions = Promise.resolve();
+    function choose(kind) {
+      transitions = transitions.then(function () { return chooseNow(kind); });
+      return transitions;
+    }
+    async function chooseNow(kind) {
       if (busy) return;
       var nextKind = active === kind ? null : kind;
       busy = true; showError(""); render("Switching microphone…",false);
@@ -464,7 +469,62 @@
       });
     });
     if (!local) { key.disabled=true; keyStatus.textContent="Manage keys and start paid transcription on this laptop's localhost board."; }
-    return {hasPending:function () { return queue.count() > 0; }};
+    var remoteEnabled = false, remoteGeneration = 0, remoteSeen = new Set();
+    var remoteButton = $("remote-mic-enable"), remoteStatus = $("remote-mic-status");
+    function remoteDisplay(message) {
+      remoteButton.textContent = remoteEnabled ? "Disable remote mic control" : "Enable remote mic control";
+      remoteButton.setAttribute("aria-pressed", String(remoteEnabled));
+      remoteStatus.textContent = message;
+    }
+    remoteButton.disabled = !local || !secure;
+    remoteButton.addEventListener("click", async function () {
+      remoteButton.disabled = true;
+      var generation = ++remoteGeneration;
+      try {
+        if (!remoteEnabled) {
+          // Obtain permission on the receiver during an explicit local click.
+          // No audio is transmitted while preparing remote control.
+          var Audio = window.AudioContext || window.webkitAudioContext;
+          var warm = new Audio();
+          var resumed = warm.resume();
+          try {
+            var capture = navigator.mediaDevices.getUserMedia({audio:true});
+            capture.then(function (stream) { stream.getTracks().forEach(function (track) { track.stop(); }); }, function () {});
+            await withTimeout(Promise.all([capture, resumed]), 20000, "Allow microphone access on this laptop, then try again.");
+          } finally { await warm.close(); }
+          if (generation !== remoteGeneration) return;
+        }
+        var result = await request("/speech/control", {client:options.micClient, enabled:!remoteEnabled});
+        if (generation !== remoteGeneration) return;
+        remoteEnabled = result.enabled;
+        remoteDisplay(remoteEnabled ? "Remote mic control is ready. Ctrl+Alt+O: Free; Ctrl+Alt+M: Paid on the sending laptop." : "Remote mic control is off.");
+      } catch (error) { remoteStatus.textContent = error.message; }
+      finally { remoteButton.disabled = !local || !secure; }
+    });
+    function remoteDisconnected() {
+      remoteGeneration++;
+      if (!remoteEnabled) return;
+      remoteEnabled = false;
+      remoteDisplay("Connection interrupted. Re-enable remote mic control after reconnecting.");
+    }
+    function remoteCommand(command) {
+      if (!remoteEnabled || !command || !["free", "paid"].includes(command.engine) || remoteSeen.has(command.id)) return;
+      remoteSeen.add(command.id);
+      if (remoteSeen.size > 2048) remoteSeen.delete(remoteSeen.values().next().value);
+      var generation = remoteGeneration;
+      transitions = transitions.then(async function () {
+        if (!remoteEnabled || generation !== remoteGeneration || !(command.expires * 1000 > Date.now())) return;
+        if (buttons[command.engine].disabled) { showError("The requested microphone is unavailable on this receiving laptop."); return; }
+        await chooseNow(command.engine);
+      });
+    }
+    window.addEventListener("pagehide", function () {
+      if (remoteEnabled) fetch("/speech/control" + location.search, {method:"POST", keepalive:true,
+        headers:{"X-Board":"1", "Content-Type":"application/json"},
+        body:JSON.stringify({client:options.micClient, enabled:false})}).catch(function () {});
+      remoteDisconnected();
+    });
+    return {hasPending:function () { return queue.count() > 0; }, remoteCommand:remoteCommand, remoteDisconnected:remoteDisconnected};
   }
 
   var api={init:init,createDeliveryQueue:createDeliveryQueue,createBrowserSession:createBrowserSession,createSpeechmaticsSession:createSpeechmaticsSession};

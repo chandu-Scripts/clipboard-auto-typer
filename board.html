@@ -296,6 +296,10 @@
   <p id="speech-key-status" role="status">No key is needed for the free mic.</p>
   <p>Your key stays saved on this laptop, including after code updates.</p>
   <p>Speechmatics uses your account credit. The free mic needs no key.</p>
+  <div class="key-actions">
+    <button id="remote-mic-enable" aria-pressed="false">Enable remote mic control</button>
+  </div>
+  <p id="remote-mic-status" role="status">Let the sending laptop control this laptop's microphone. Keep this tab open.</p>
 </dialog>
 <div id="toast" role="status" aria-live="polite"></div>
 
@@ -634,9 +638,15 @@
   // Opened from the sending laptop, the page's own URL carries the shared
   // secret as ?s=... - forwarded here so the server-side check passes.
   // Opened on this laptop there's no query string, so this is a no-op.
-  var source = new EventSource("/stream" + location.search);
+  var micClient = window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : "";
+  var streamParams = new URLSearchParams(location.search);
+  streamParams.set("client", micClient);
+  var source = new EventSource("/stream?" + streamParams.toString());
   source.onopen = function () { setLink(true); };
-  source.onerror = function () { setLink(false); };
+  source.onerror = function () { setLink(false); if (speech) speech.remoteDisconnected(); };
+  source.addEventListener("mic-command", function (e) {
+    if (speech) speech.remoteCommand(JSON.parse(e.data));
+  });
   source.addEventListener("snapshot", function (e) {
     var d = JSON.parse(e.data);
     setCommitted(d.text);
@@ -658,7 +668,7 @@
 
   // Both speech engines share the board's existing rendering and history.
   var speech = AnswerBoardSpeech.init({
-    $: $, prefs: prefs, savePrefs: savePrefs, toast: toast,
+    $: $, prefs: prefs, savePrefs: savePrefs, toast: toast, micClient: micClient,
     keywords: function () { return keywords.slice(); },
     interim: function (text) {
       var t = text.trim();

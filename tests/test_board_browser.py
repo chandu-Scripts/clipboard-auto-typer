@@ -96,7 +96,7 @@ def test_pending_delivery_retries_in_order(page):
     expect(page.locator("#committed")).to_have_text("first second")
     assert [call["text"] for call in calls] == ["first", "first", "second"]
     assert calls[0]["id"] == calls[1]["id"]
-    expect(page.locator("#speech-pending")).to_have_text("")
+    expect(page.locator("#speech-error")).to_have_text("")
     page.locator("#mic").click()
 
 
@@ -176,19 +176,18 @@ def test_network_error_does_not_show_listening(page):
     page.locator("#mic").click()
 
 
-def test_unfinished_preview_is_recoverable_after_browser_restart(page):
+def test_unfinished_preview_joins_board_after_browser_restart(page):
     page.locator("#mic").click()
     expect(page.locator("#mic-note")).to_have_text("Listening · Free")
     page.evaluate("recognizers[0].emit([{text:'unfinished technical phrase',final:false}])")
     page.evaluate("recognizers[0].onend()")
-    expect(page.locator("#speech-error")).to_contain_text("preview is saved")
-    expect(page.locator("#speech-copy-pending")).to_be_visible()
+    expect(page.locator("#committed")).to_have_text("unfinished technical phrase")
+    expect(page.locator("#speech-error")).to_have_text("")
+    expect(page.locator("#speech-copy-pending")).to_have_count(0)
     expect(page.locator("#mic-note")).to_have_text("Listening · Free")
     assert page.evaluate("recognizers.length") == 2
     page.evaluate("recognizers[1].emit([{text:'new sentence',final:true}])")
-    expect(page.locator("#committed")).to_have_text("new sentence")
-    drafts = page.evaluate("JSON.parse(sessionStorage.getItem('answerboard.speech-drafts.v1'))")
-    assert drafts == ["unfinished technical phrase"]
+    expect(page.locator("#committed")).to_have_text("unfinished technical phrase new sentence")
     page.locator("#mic").click()
 
 
@@ -197,12 +196,12 @@ def test_queued_final_survives_page_refresh(page):
     page.locator("#mic").click()
     expect(page.locator("#mic-note")).to_have_text("Listening · Free")
     page.evaluate("recognizers[0].emit([{text:'recover this transcript',final:true}])")
-    expect(page.locator("#speech-pending")).to_contain_text("Retrying")
+    expect(page.locator("#speech-error")).to_contain_text("Reconnecting to the board")
     page.locator("#mic").click()
     page.unroute("**/append")
     page.reload()
     expect(page.locator("#committed")).to_have_text("recover this transcript")
-    expect(page.locator("#speech-pending")).to_have_text("")
+    expect(page.locator("#speech-error")).to_have_text("")
 
 
 def test_paid_error_preserves_preview_and_stops(page, monkeypatch):
@@ -224,8 +223,30 @@ def test_paid_error_preserves_preview_and_stops(page, monkeypatch):
     sockets[0].send(json.dumps({"message":"Error", "type":"insufficient_funds"}))
     expect(page.locator("#speech-error")).to_contain_text("needs more credit")
     expect(page.locator("#mic-note")).to_have_text("Microphones off")
-    assert page.evaluate("JSON.parse(sessionStorage.getItem('answerboard.speech-drafts.v1'))") == ["unfinished paid phrase"]
-    expect(page.locator("#speech-copy-pending")).to_be_visible()
+    expect(page.locator("#committed")).to_have_text("unfinished paid phrase")
+    expect(page.locator("#speech-copy-pending")).to_have_count(0)
+
+
+def test_old_saved_previews_are_automatically_added_once(page):
+    page.evaluate("sessionStorage.setItem('answerboard.speech-drafts.v1', JSON.stringify(['previous words']))")
+    page.reload()
+    expect(page.locator("#committed")).to_have_text("previous words")
+    assert page.evaluate("sessionStorage.getItem('answerboard.speech-drafts.v1')") is None
+    page.reload()
+    expect(page.locator("#committed")).to_have_text("previous words")
+
+
+def test_stop_without_final_result_keeps_words_on_board_once(page):
+    page.locator("#mic").click()
+    expect(page.locator("#mic-note")).to_have_text("Listening · Free")
+    page.evaluate("recognizers[0].emit([{text:'last recognized words',final:false}])")
+    page.locator("#mic").click()
+    expect(page.locator("#committed")).to_have_text("last recognized words")
+    page.locator("#mic").click()
+    expect(page.locator("#mic-note")).to_have_text("Listening · Free")
+    page.locator("#mic").click()
+    expect(page.locator("#mic-note")).to_have_text("Microphones off")
+    expect(page.locator("#committed")).to_have_text("last recognized words")
 
 
 def test_board_layout(page, tmp_path):

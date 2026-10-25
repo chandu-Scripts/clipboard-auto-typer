@@ -145,7 +145,6 @@
         if (stopping || !wanted) { finish(); return; }
         if (interim.trim()) {
           options.onDraft(interim); interim = ""; options.onInterim("");
-          options.onError("The browser ended before finishing a phrase. Its preview is saved in Copy pending text.");
         }
         failures++;
         options.onState("Reconnecting free mic…", false);
@@ -169,7 +168,6 @@
           stopTimer = setTimeout(function () {
             var old = recognition; recognition = null;
             if (old) { try { old.abort(); } catch (_) { /* stopped */ } }
-            if (interim.trim()) options.onError("The last phrase did not finalize. It is still available in Copy pending text.");
             finish();
           }, 8000);
           try { recognition.stop(); } catch (_) { finish(); }
@@ -298,7 +296,7 @@
           }), 1500, "Audio flush timed out.");
           capturing = false; releaseAudio();
           socket.send(JSON.stringify({message:"EndOfStream", last_seq_no:sequence}));
-          await withTimeout(ended, 12000, "Speechmatics did not finish the last phrase. Copy pending text if needed.");
+          await withTimeout(ended, 12000, "Speechmatics stopped responding. The last recognized words will be added to the board.");
         } catch (error) { options.onError(error.message); }
         finally { cleanup(); }
       }
@@ -312,7 +310,8 @@
     if (!Array.isArray(drafts)) drafts = [];
     drafts = drafts.filter(function (text) { return typeof text === "string"; });
     var buttons = {free:$("mic"), paid:$("mic-paid")};
-    var note = $("mic-note"), pendingNote = $("speech-pending"), errorNote = $("speech-error");
+    var note = $("mic-note"), errorNote = $("speech-error");
+    var deliveryMessage = "Reconnecting to the board… Your text will sync automatically.";
     var lang = $("lang"), local = ["localhost","127.0.0.1","[::1]"].indexOf(location.hostname) !== -1;
     var secure = window.isSecureContext;
     var Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -321,11 +320,10 @@
     languages.forEach(function (entry) { var option=document.createElement("option"); option.value=entry[1]; option.textContent=entry[0]; lang.appendChild(option); });
     lang.value = languages.some(function (entry) { return entry[1] === options.prefs.lang; }) ? options.prefs.lang : "en-IN";
     lang.addEventListener("change", function () { options.prefs.lang = lang.value; options.savePrefs(); });
-    function saveDrafts() {
-      try { sessionStorage.setItem("answerboard.speech-drafts.v1", JSON.stringify(drafts)); } catch (_) { /* retained in memory */ }
-    }
-    function keepDraft(text) { if (text.trim()) { drafts.push(text.trim()); saveDrafts(); } }
-    function setInterim(text) { interim = text; options.interim(text); $("speech-copy-pending").hidden = !(text.trim() || queue.count() || drafts.length); }
+    // If an engine ends without finalizing, keep its latest recognized words
+    // on the same board as all other speech. No separate recovery workflow.
+    function keepDraft(text) { if (text.trim()) queue.add(text); }
+    function setInterim(text) { interim = text; options.interim(text); }
     function showError(message) { errorNote.textContent = message; }
     function render(state, listening) {
       note.textContent = state;
@@ -340,7 +338,7 @@
     }
     var queue = createDeliveryQueue({
       load:function () { try { return JSON.parse(sessionStorage.getItem("answerboard.pending-speech.v1") || "[]"); } catch (_) { return []; } },
-      save:function (pending) { try { sessionStorage.setItem("answerboard.pending-speech.v1",JSON.stringify(pending)); } catch (_) { showError("Pending text cannot be saved in this browser. Keep this tab open or use Copy pending text."); } },
+      save:function (pending) { try { sessionStorage.setItem("answerboard.pending-speech.v1",JSON.stringify(pending)); } catch (_) { showError("Browser storage is unavailable. Keep this tab open until your text reaches the board."); } },
       id:function () { return window.crypto.randomUUID(); },
       send:async function (phrase) {
         var abort = new AbortController(), timer = setTimeout(function () { abort.abort(); },10000);
@@ -350,11 +348,15 @@
         } finally { clearTimeout(timer); }
       },
       changed:function (count,error) {
-        pendingNote.textContent = error || (count ? "Sending " + count + " phrase(s)…" : "");
-        $("speech-copy-pending").hidden = !(count || interim.trim() || drafts.length);
+        if (error) showError(deliveryMessage);
+        else if (errorNote.textContent === deliveryMessage) showError("");
       }
     });
     queue.start();
+    // Upgrade older tabs: previously saved previews now join the board too.
+    drafts.forEach(keepDraft);
+    try { sessionStorage.removeItem("answerboard.speech-drafts.v1"); } catch (_) { /* storage unavailable */ }
+    drafts = [];
     async function choose(kind) {
       if (busy) return;
       var nextKind = active === kind ? null : kind;
@@ -363,7 +365,6 @@
         if (session) await session.stop();
         session = null; active = null;
         if (!nextKind) { render("Microphones off",false); return; }
-        if (interim.trim()) { showError("Unfinished text remains in Copy pending text. Copy it before starting again."); return; }
         active = nextKind;
         var mine;
         var hooks = {
@@ -394,17 +395,9 @@
     }
     buttons.free.addEventListener("click",function () { choose("free"); });
     buttons.paid.addEventListener("click",function () { choose("paid"); });
-    $("speech-copy-pending").addEventListener("click", async function () {
-      try {
-        await navigator.clipboard.writeText(drafts.concat([queue.text(),interim]).filter(Boolean).join(" "));
-        drafts=[]; saveDrafts();
-        if (!active) setInterim("");
-        options.toast("Pending text copied. Queued final phrases will still retry.");
-      } catch (_) { showError("Could not copy. Select the grey text and copy it manually."); }
-    });
     window.addEventListener("online",queue.retry);
     window.addEventListener("beforeunload",function (event) {
-      if (active || queue.count() || interim.trim() || drafts.length) { event.preventDefault(); event.returnValue=""; }
+      if (active || queue.count() || interim.trim()) { event.preventDefault(); event.returnValue=""; }
     });
     // No visibilitychange restart: changing tabs must not abort valid speech.
     if (!secure) showError("For microphone access, open http://localhost:8766 on the laptop running the app. The LAN page can still display answers.");

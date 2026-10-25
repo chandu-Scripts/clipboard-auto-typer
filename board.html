@@ -112,7 +112,6 @@
   .speech-messages { padding: 0 18px; font-size: 12px; }
   .speech-messages p:empty { display: none; }
   #speech-error { color: var(--bad); }
-  #speech-pending { color: var(--accent); }
   #speech-settings { display: inline-flex; align-items: center; gap: 7px; }
   #speech-settings-panel {
     width: min(460px, calc(100vw - 32px)); max-height: calc(100vh - 48px);
@@ -235,8 +234,7 @@
       <button id="clear" class="danger">Clear</button>
     </div>
     <div class="speech-messages" aria-live="polite">
-      <p id="speech-error"></p><p id="speech-pending"></p>
-      <button id="speech-copy-pending" hidden>Copy pending text</button>
+      <p id="speech-error"></p>
     </div>
     <div class="toolbar kw-bar" id="kw-bar" hidden>
       <input id="kw-input" type="text" placeholder="Add a keyword (one word)…" aria-label="Keyword to highlight" maxlength="40" autocomplete="off" spellcheck="false">
